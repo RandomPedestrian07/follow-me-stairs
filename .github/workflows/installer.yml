@@ -48,9 +48,10 @@ jobs:
           BUILD_DIR: ${{ steps.build.outputs.name }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          mkdir -p site
+          mkdir -p site/fonts
           cp -r "$BUILD_DIR" site/firmware
           rm -f site/firmware/*.elf
+          cp wizard/fonts/plex-sans.woff2 wizard/fonts/plex-mono-400.woff2 wizard/fonts/OFL.txt site/fonts/
           sed "s/__VERSION__/$VERSION/g" installer/index.html > site/index.html
           ls -R site
 
