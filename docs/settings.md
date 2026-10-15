@@ -3,7 +3,7 @@ type: reference
 audience: functional
 reader: Owner of an Apollo MTR-1 and a WLED strip, with or without Home Assistant. Can flash ESPHome and change WLED settings. Has this repository, their own sensor and their own WLED controller. Does not read the firmware source.
 owner: follow-me-stairs maintainer
-last_verified: 2026-10-14. Names, ranges, defaults and behaviour checked against firmware/follow-me.yaml and firmware/follow-me.h. Not checked: how each control renders on the sensor's web page.
+last_verified: 2026-10-14. Names, ranges, defaults and behaviour checked against firmware/follow-me.yaml and firmware/follow-me.h. Not checked: how each control renders on the sensor's web page. Defaults confirmed on hardware with the published 2026.10.3 firmware.
 sources: firmware/follow-me.yaml, firmware/follow-me.h, firmware/follow-me-calibration.h
 -->
 
@@ -56,7 +56,7 @@ Where the window and the night light overlap, each LED shows the brighter of the
 |---|---|---|
 | Follow-Me Multi-Person | Off: one window follows one person. On: up to three windows follow up to three people. With it on, a new window starts only near either end of the stairs. | Off |
 | Follow-Me Pause While WLED On | Lets WLED take over the strip while WLED itself is on. On: while WLED itself is on, follow-me sends nothing and the strip shows WLED's own state. WLED can be turned on from its app, its button or Home Assistant. Follow-me starts again when WLED turns off. Off: follow-me lights the strip when WLED is on or off. | On |
-| Follow-Me RGB White | For strips with no white LED only. Sets how the sensor mixes white from red, green and blue: Warm, Neutral or Cool. It applies to Follow-Me Glow and Follow-Me Night Light. | Warm |
+| Follow-Me RGB White | For strips with no white LED only. Sets how the sensor mixes white from red, green and blue: Warm, Neutral or Cool. It applies to Follow-Me Glow and Follow-Me Night Light. | Neutral |
 
 ## Status
 
