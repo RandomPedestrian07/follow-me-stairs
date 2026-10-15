@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Follow-Me Installer</title>
+<meta name="description" content="Install the follow-me stair light on an Apollo MTR-1 from your browser.">
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<style>
+:root{
+  --bg:#ffffff; --text:#1f1f1f; --muted:#5f5f5f; --line:#e2e2e2; --accent:#b35c00; --warn-bg:#fff5e8;
+  --button:#1f1f1f; --button-text:#ffffff;
+  color-scheme:light dark;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#121212; --text:#e8e8e8; --muted:#a0a0a0; --line:#2e2e2e; --accent:#ffb35a; --warn-bg:#2a2016;
+    --button:#e8e8e8; --button-text:#121212}
+}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:640px;margin:0 auto;padding:48px 16px 64px}
+h1{font-size:28px;line-height:1.2;margin:0 0 12px}
+h2{font-size:19px;margin:40px 0 10px}
+p{margin:0 0 12px}
+.muted{color:var(--muted)}
+ol{padding-left:22px;margin:0 0 20px}
+li{margin:0 0 6px}
+a{color:var(--accent)}
+code{font:14px ui-monospace,Menlo,monospace}
+.install{margin:24px 0 0}
+.install button{border:0;border-radius:6px;background:var(--button);color:var(--button-text);font:600 16px/1 system-ui,sans-serif;padding:13px 20px;cursor:pointer}
+esp-web-install-button[install-unsupported] button{display:none}
+.warn{background:var(--warn-bg);border-left:3px solid var(--accent);padding:10px 14px;margin:20px 0 0;font-size:15px}
+footer{border-top:1px solid var(--line);margin-top:48px;padding-top:16px;font-size:14px;color:var(--muted)}
+footer ul{list-style:none;padding:0;margin:0 0 12px}
+footer li{display:inline;margin-right:16px}
+/* ESP Web Tools dialogs */
+esp-web-install-button{--improv-primary-color:var(--accent);--mdc-theme-primary:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Follow-Me installer</h1>
+  <p>Follow-me is a stair light. A radar sensor at the stairs tracks where each person is. An LED strip along the stairs lights the part next to that person, and the lit part moves with them.</p>
+  <p class="muted">This page installs follow-me on an Apollo MTR-1. Version __VERSION__.</p>
+
+  <h2>Install</h2>
+  <p class="muted">Use Chrome or Edge on a computer. Phones and other browsers cannot connect to the sensor over USB.</p>
+  <ol>
+    <li>Connect the MTR-1 to this computer with a USB-C data cable. A charge-only cable does not work.</li>
+    <li>Click <b>Install Follow-Me</b> and pick the sensor from the list.</li>
+    <li>When the install is complete, enter your Wi-Fi name and password.</li>
+    <li>Click <b>Visit device</b> to open the sensor's web page.</li>
+  </ol>
+  <esp-web-install-button class="install" manifest="firmware/manifest.json">
+    <button slot="activate">Install Follow-Me</button>
+    <p slot="unsupported">This browser cannot install firmware. Open this page in Chrome or Edge on a computer.</p>
+    <p slot="not-allowed">The installer works only over HTTPS. Open this page from its https:// address.</p>
+  </esp-web-install-button>
+  <p class="warn">Installing erases the sensor. A sensor that already has a follow-me setup must go through the setup wizard again. To keep the setup, update the sensor from ESPHome instead.</p>
+
+  <h2>After installing</h2>
+  <p>On the sensor's web page, click <b>Set up Follow-Me</b>. The setup wizard asks for the shape of your stairs, has you walk them once, and lines up the LED strip.</p>
+  <p>If the Wi-Fi step did not appear, connect your phone to the <code>Apollo MTR1 Hotspot</code> network and enter your Wi-Fi there.</p>
+  <p>WLED needs some settings changed first. The wizard checks them and can change them for you.</p>
+
+  <footer>
+    <ul>
+      <li><a href="https://github.com/RandomPedestrian07/follow-me-stairs">Source and documentation</a></li>
+      <li><a href="https://github.com/RandomPedestrian07/follow-me-stairs/blob/main/docs/settings.md">Settings</a></li>
+    </ul>
+    MIT license. Installer by <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.
+  </footer>
+</main>
+</body>
+</html>

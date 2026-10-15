@@ -1,0 +1,79 @@
+# Builds installer/apollo-mtr-1.factory.yaml and publishes the browser
+# installer (installer/index.html, the firmware and its ESP Web Tools
+# manifest) to GitHub Pages. Runs on a version tag (v2026.10.0) or by hand.
+# The site holds one firmware: the latest build.
+
+name: Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: installer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then v="${GITHUB_REF_NAME#v}"; else v="dev-${GITHUB_SHA::7}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build firmware
+        id: build
+        uses: esphome/build-action@ae5408cdbc4f70692bf8e345c4982bca05a93667  # v8.1.0
+        with:
+          yaml-file: installer/apollo-mtr-1.factory.yaml
+          version: 2026.8.2
+          complete-manifest: true
+          substitutions: |
+            follow_me_version=${{ steps.version.outputs.version }}
+
+      - name: Assemble site
+        env:
+          BUILD_DIR: ${{ steps.build.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p site
+          cp -r "$BUILD_DIR" site/firmware
+          rm -f site/firmware/*.elf
+          sed "s/__VERSION__/$VERSION/g" installer/index.html > site/index.html
+          ls -R site
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: site
+          retention-days: 1
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

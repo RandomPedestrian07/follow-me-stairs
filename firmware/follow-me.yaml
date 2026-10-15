@@ -1,0 +1,988 @@
+# Follow-me stair light. ESPHome package for an LD2450 radar device such as
+# the Apollo MTR-1 (ESP32, esp-idf, ESPHome 2026.8.2 or newer, web_server).
+#
+# Reads the radar's three tracked targets, keeps the ones on the stairs, and
+# streams a lit window around each person's position to a WLED controller over
+# DDP (UDP port 4048), 4 bytes per LED on strips with a white channel and 3
+# otherwise, as WLED reports. The stream lights the strip only while it is
+# being sent; WLED returns to its own state after its realtime timeout.
+#
+# Everything about the stairs, the strip and the WLED address comes from the
+# calibration the setup wizard stores on the device
+# (follow-me-calibration.h). The device serves the wizard at /followme, and
+# the stock web page links to it. The LED count and strip type come from WLED
+# (follow-me.h). "Follow-Me Setup" reports what is missing: "No web server",
+# "Not set up", "Radar not found", "WLED not found", or "Ready".
+#
+# Radar targets are found by name (substitutions radar_x_name, radar_y_name;
+# Apollo's names by default).
+#
+# Manual control: with "Follow-Me Pause While WLED On" set (the default),
+# while the WLED controller itself is on (turned on from Home Assistant, the
+# WLED app or its button), follow-me sends nothing and the strip shows WLED's
+# own state. follow-me.h polls WLED's on/off on a background task and makes
+# WLED leave realtime mode the moment it turns on; follow-me resumes, starting
+# fresh, once WLED is off again. "Follow-Me Paused" shows WLED's on/off. An
+# unreachable WLED counts as off. With the switch cleared, follow-me streams
+# whatever WLED's own state is.
+#
+# Behaviour:
+#   - Positions are wall inches: inches along the stairs, 0 at the top edge
+#     of the top step, increasing down the stairs. Each target is projected
+#     onto its nearest point on the calibrated walking path. Targets farther
+#     than GATE_WIDTHS stair widths from the path (GATE_END_STEPS steps beyond
+#     either end of it) are ignored: people on the floors above and below,
+#     and reflections.
+#   - Distances scale with the staircase: "steps" are the calibration's mean
+#     tread run. "Follow-Me Window", "Follow-Me Buffer", "Follow-Me Night Light
+#     Size", "Follow-Me Offset" and "Follow-Me Approach" are in steps, as are
+#     the internal ranges.
+#   - Approach: a person off the stairs within "Follow-Me Approach" steps of
+#     either end (2 by default) is followed, with the window held at that end
+#     of the stairs, so the light is on before they step onto the stairs;
+#     farther out they are ignored.
+#   - Gaps: where the strip has a gap (a jumper across a landing, a corner),
+#     windows are drawn with the gap squeezed to the strip's usual LED
+#     spacing, so a window crossing it lights both sides
+#     (follow-me-calibration.h).
+#   - "Follow-Me Offset" puts the window that many steps ahead of the person
+#     in the direction they walk (higher going up, lower going down; negative
+#     values put it behind), 0 by default. It blends in with walking speed,
+#     reaching full strength at OFFSET_FULL_SPEED, so standing still has no
+#     shift.
+#   - Motion: an alpha-beta filter estimates position and walking speed from
+#     the radar frames, and the position is taken LEAD seconds ahead of the
+#     estimate (cancelling radar latency). "Follow-Me Smoothness" sets the
+#     filter and easing weight: 0% follows the radar closely, 100% is slow and
+#     floaty.
+#   - The light is a solid window "Follow-Me Window" steps long. The window
+#     stays still while the person is inside it and slides only when the
+#     person comes within "Follow-Me Buffer" steps of either end, by just
+#     enough to keep that margin. Its edges are anti-aliased, so only the
+#     first and last LED are ever partly lit. The window never moves faster
+#     than MAX_SPEED and its motion is eased. Only the stairs are lit: parts
+#     of the window past either end of the stairs or the strip stay dark.
+#   - Arrival: when the light turns on with the person within ENTRANCE_STEPS
+#     steps of either end of the stairs (at most ENTRANCE_MAX_FRACTION of
+#     their length), the window enters from that end and springs to the
+#     person (underdamped, about 20% overshoot), fading in over ENTRANCE_FADE
+#     seconds. Anywhere else it appears centred on the person and fades in
+#     over "Follow-Me Fade In" seconds. On loss it holds for "Follow-Me Hold"
+#     seconds, then fades out in place.
+#   - Leaving: once a person who was on the stairs is past either end, there
+#     is no hold; the window shrinks toward that end while fading out over
+#     EXIT_FADE seconds. It stays dark while that person lingers off the
+#     stairs, and arrives again when they step back on, move REARM_STEPS back
+#     toward the stairs from the farthest point they reached, or have been out
+#     of sight for "Follow-Me Hold" seconds. A person first seen off the
+#     stairs arrives as usual. Fades follow a smoothstep curve.
+#   - People: with "Follow-Me Multi-Person" off, one window follows one
+#     person (the target nearest the current window). With it on, up to three
+#     windows follow up to three people; radar targets are matched to windows
+#     by nearest position (at most ASSOC_JUMP_S at MAX_SPEED apart), and where
+#     windows overlap each LED takes the brighter. In multi-person mode a new
+#     window starts only for a target near either end of the stairs (the
+#     entrance range) and at least DUP_GAP_STEPS from every existing window,
+#     so reflections do not get one; a person the radar loses mid-stairs for
+#     longer than "Follow-Me Hold" is picked up again only near an end.
+#   - Look: the "Follow-Me Glow" light sets on/off (follow-me enabled),
+#     brightness and colour. It is an RGBW light so a white channel is its own
+#     control; the default is white only at 40%. All windows share it. Its
+#     channel values are the window's peak; ESPHome's gamma is off and the
+#     window edges use gamma 2.2 (see wled/README.md). No trail, no
+#     dithering. On a strip without a white channel the white channel is mixed
+#     from red, green and blue as "Follow-Me RGB White" picks (warm, neutral
+#     or cool).
+#   - Effects: picking an effect on the "Follow-Me Glow" light (Rainbow,
+#     holiday themes, Fireplace, Aurora, Ocean and others) replaces its colour
+#     with a moving per-LED pattern at the light's brightness, inside the same
+#     windows, fades and entrance. The patterns live in follow-me-effects.h
+#     and are fixed to the stairs, so a person walks through them;
+#     firework-style ones burst inside the person's window. The effects
+#     themselves do nothing in ESPHome; the stream paints them. Turning the
+#     light off resets the effect to None (ESPHome behaviour). At boot, an
+#     effect name without a pattern is logged as an error.
+#   - Night light: while the "Follow-Me Night Light" light is on, a patch
+#     "Follow-Me Night Light Size" steps long is lit at each end of the
+#     stairs, with a raised-cosine fade over NL_EDGE_STEPS on its inner side.
+#     It is its own RGBW light (default white only at 5%, 1 s transitions)
+#     and runs whether or not follow-me is enabled. Windows draw over it: each
+#     LED channel takes the brighter of the window and the night light.
+#     Scheduling it is left to Home Assistant.
+#   - LED preview: while the setup wizard asks for it (/followme/preview), the
+#     stream shows only the LED being matched, overriding everything above.
+#
+# Strip: the wizard's LED anchors pin LED numbers to spots along the path;
+# LED positions are interpolated between anchors and extrapolated past the
+# outer ones, so strips in pieces, with gaps, or running in either direction
+# map correctly. LED numbers are raw indexes on the WLED controller, as DDP
+# addresses them, independent of WLED's segments. Up to MAX_STREAM_LEDS LEDs.
+
+esphome:
+  includes:
+    - ${follow_me_dir}/follow-me.h
+    - ${follow_me_dir}/follow-me-effects.h
+    - ${follow_me_dir}/follow-me-wizard.h
+    - ${follow_me_dir}/follow-me-calibration.h
+
+# Adds a "Set up Follow-Me" link to the stock web page, opening the setup
+# wizard served at /followme. Merges with the device's own web_server.
+# The stock web page, served from the device so it works without internet,
+# with a "Set up Follow-Me" button that opens the wizard (/followme).
+web_server:
+  local: true
+  js_include: ${follow_me_dir}/follow-me-button.js
+
+substitutions:
+  # Folder holding the follow-me headers, relative to the device file
+  # (ESPHome resolves includes from the device file, not from this package).
+  follow_me_dir: .
+  # Names of the radar's target X/Y sensors (raw state in mm); %d is the
+  # target number, 1-3. The defaults are Apollo's.
+  radar_x_name: "Target-%d X"
+  radar_y_name: "Target-%d Y"
+
+globals:
+  # Follow-Me Glow channel values, 0-1.
+  - id: fm_red
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: fm_green
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: fm_blue
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: fm_white
+    type: float
+    restore_value: no
+    initial_value: "0"
+  # Follow-Me Night Light channel values, 0-1.
+  - id: nl_red
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: nl_green
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: nl_blue
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: nl_white
+    type: float
+    restore_value: no
+    initial_value: "0"
+
+output:
+  # Follow-Me Glow channel values (brightness applied), read by the stream.
+  - platform: template
+    id: fm_out_r
+    type: float
+    write_action:
+      - lambda: id(fm_red) = state;
+  - platform: template
+    id: fm_out_g
+    type: float
+    write_action:
+      - lambda: id(fm_green) = state;
+  - platform: template
+    id: fm_out_b
+    type: float
+    write_action:
+      - lambda: id(fm_blue) = state;
+  - platform: template
+    id: fm_out_w
+    type: float
+    write_action:
+      - lambda: id(fm_white) = state;
+  # Follow-Me Night Light channel values (brightness applied).
+  - platform: template
+    id: nl_out_r
+    type: float
+    write_action:
+      - lambda: id(nl_red) = state;
+  - platform: template
+    id: nl_out_g
+    type: float
+    write_action:
+      - lambda: id(nl_green) = state;
+  - platform: template
+    id: nl_out_b
+    type: float
+    write_action:
+      - lambda: id(nl_blue) = state;
+  - platform: template
+    id: nl_out_w
+    type: float
+    write_action:
+      - lambda: id(nl_white) = state;
+
+light:
+  - platform: rgbw
+    id: follow_me_glow
+    name: "Follow-Me Glow"
+    icon: mdi:stairs
+    red: fm_out_r
+    green: fm_out_g
+    blue: fm_out_b
+    white: fm_out_w
+    color_interlock: false
+    gamma_correct: 1.0
+    default_transition_length: 500ms
+    restore_mode: RESTORE_DEFAULT_ON
+    initial_state:
+      state: true
+      color_mode: RGB_WHITE
+      brightness: 40%
+      color_brightness: 0%  # RGB off; ESPHome normalises an all-zero red/green/blue to white
+      white: 100%
+    # Effects only name a pattern; the stream paints it (follow-me-effects.h,
+    # whose EFFECT_NAMES must match these names).
+    effects:
+      - lambda:
+          name: "Rainbow"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "New Year's"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Valentine's"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "St. Patrick's"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Easter"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Fourth of July"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Autumn"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Halloween"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Haunted"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Hanukkah"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Christmas"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Candy Cane"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Snowfall"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Fireplace"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Aurora"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+      - lambda:
+          name: "Ocean"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
+  - platform: rgbw
+    id: follow_me_night_light
+    name: "Follow-Me Night Light"
+    icon: mdi:weather-night
+    red: nl_out_r
+    green: nl_out_g
+    blue: nl_out_b
+    white: nl_out_w
+    color_interlock: false
+    gamma_correct: 1.0
+    default_transition_length: 1s
+    restore_mode: RESTORE_DEFAULT_OFF
+    initial_state:
+      state: false
+      color_mode: RGB_WHITE
+      brightness: 5%
+      color_brightness: 0%  # RGB off; ESPHome normalises an all-zero red/green/blue to white
+      white: 100%
+
+switch:
+  - platform: template
+    id: follow_me_multi
+    name: "Follow-Me Multi-Person"
+    icon: mdi:account-multiple
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: follow_me_pause_on
+    name: "Follow-Me Pause While WLED On"
+    icon: mdi:hand-back-right
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+select:
+  - platform: template
+    id: follow_me_rgb_white
+    name: "Follow-Me RGB White"
+    icon: mdi:palette
+    entity_category: config
+    options: ["Warm", "Neutral", "Cool"]
+    initial_option: "Neutral"
+    optimistic: true
+    restore_value: true
+
+number:
+  - platform: template
+    id: follow_me_night_light_size
+    name: "Follow-Me Night Light Size"
+    icon: mdi:arrow-expand-horizontal
+    entity_category: config
+    unit_of_measurement: "steps"
+    mode: box
+    min_value: 0.5
+    max_value: 8
+    step: 0.5
+    initial_value: 2
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_approach
+    name: "Follow-Me Approach"
+    icon: mdi:walk
+    entity_category: config
+    unit_of_measurement: "steps"
+    mode: box
+    min_value: 0
+    max_value: 6
+    step: 0.5
+    initial_value: 2
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_window
+    name: "Follow-Me Window"
+    icon: mdi:arrow-expand-vertical
+    entity_category: config
+    unit_of_measurement: "steps"
+    mode: box
+    min_value: 1
+    max_value: 15
+    step: 0.5
+    initial_value: 3
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_buffer
+    name: "Follow-Me Buffer"
+    icon: mdi:arrow-collapse-vertical
+    entity_category: config
+    unit_of_measurement: "steps"
+    mode: box
+    min_value: 0
+    max_value: 5
+    step: 0.25
+    initial_value: 1
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_hold
+    name: "Follow-Me Hold"
+    icon: mdi:timer-sand
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0
+    max_value: 60
+    step: 1
+    initial_value: 4
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_offset
+    name: "Follow-Me Offset"
+    icon: mdi:arrow-up-down
+    entity_category: config
+    unit_of_measurement: "steps"
+    mode: box
+    min_value: -3
+    max_value: 3
+    step: 0.25
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_smoothness
+    name: "Follow-Me Smoothness"
+    icon: mdi:waves
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 50
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_fade_in
+    name: "Follow-Me Fade In"
+    icon: mdi:transition
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0.1
+    max_value: 10
+    step: 0.1
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: follow_me_fade_out
+    name: "Follow-Me Fade Out"
+    icon: mdi:transition
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0.1
+    max_value: 10
+    step: 0.1
+    initial_value: 3.0
+    optimistic: true
+    restore_value: true
+
+binary_sensor:
+  - platform: template
+    name: "Follow-Me Paused"
+    icon: mdi:hand-back-right
+    entity_category: diagnostic
+    lambda: return follow_me::wled_on.load();
+
+sensor:
+  - platform: template
+    name: "Follow-Me Position"
+    icon: mdi:map-marker-path
+    entity_category: diagnostic
+    unit_of_measurement: "steps"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      const float p = follow_me::display_pos();
+      return follow_me::geo.ready ? p / follow_me::geo.inches_per_step : NAN;
+
+text_sensor:
+  - platform: template
+    name: "Follow-Me Setup"
+    icon: mdi:stairs-box
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      if (!follow_me::web_ready) return {"No web server"};
+      if (!follow_me::geo.ready) return {"Not set up"};
+      if (follow_me::radar_missing) return {"Radar not found"};
+      if (follow_me::wled_leds.load() == 0) return {"WLED not found"};
+      return {"Ready"};
+
+interval:
+  - interval: 20ms
+    then:
+      - lambda: |-
+          // Distances scale with the calibrated staircase: STEP is its mean
+          // tread run, WIDTH its width (both wall inches). Times and speeds are
+          // about people and the radar, the same everywhere.
+          static const float GATE_WIDTHS = 0.8f;    // accepted distance from the path, in stair widths (half the stair plus radar wobble)
+          static const float GATE_END_STEPS = 4.0f;  // accepted distance beyond either end of the path
+          static const float EXIT_FADE = 1.0f;      // seconds, shrink and fade after leaving the stairs
+          static const float REARM_STEPS = 1.0f;    // walking back toward the stairs this far (radar distance) ends lingering
+          static const float ENTRANCE_STEPS = 3.0f;  // from an end of the stairs: the entrance animation and new multi-person windows
+          static const float ENTRANCE_MAX_FRACTION = 0.33f;  // ... but at most this fraction of the stairs' length
+          static const float ENTRANCE_W = 8.0f;     // entrance spring natural frequency, rad/s
+          static const float ENTRANCE_ZETA = 0.45f;  // entrance spring damping (about 20% overshoot)
+          static const float ENTRANCE_FADE = 0.25f;  // seconds
+          static const uint32_t ENTRANCE_MAX_MS = 1500;
+          static const float DUP_GAP_STEPS = 1.5f;  // nearest a new window may start to an existing one
+          static const float NL_EDGE_STEPS = 0.6f;  // night light patch soft edge
+          static const float GAMMA = 2.2f;
+          static const float MAX_SPEED = 60.0f;     // inches/s (1.5 m/s): window speed cap, above a brisk stair walk
+          static const float ASSOC_JUMP_S = 1.0f;   // multi-person: a window's person moves at most MAX_SPEED for this long between matches
+          static const float LEAD = 0.25f;          // seconds taken ahead of the estimate (LD2450 latency)
+          static const float OFFSET_FULL_SPEED = 10.0f;  // inches/s: "Follow-Me Offset" applies fully from this walking speed
+          static const float STALE_MS = 400;        // no new radar frame for this long: speed decays
+          static const int TRAILING_ZEROS = 5;      // dark frames sent after fading out
+          static const uint32_t KEEPALIVE_MS = 1000;  // resend an unchanged frame this often (WLED leaves realtime mode after its timeout, 2.5 s by default)
+          // White channel as red, green, blue on strips without one ("Follow-Me RGB White").
+          static const float WHITE_MIX[3][3] = {{1.0f, 0.72f, 0.42f}, {1.0f, 0.88f, 0.74f}, {0.86f, 0.92f, 1.0f}};
+
+          // First run: stored calibration, its web endpoints, the WLED watcher,
+          // and a check that the effect names here match follow-me-effects.h.
+          static bool started = false;
+          if (!started) {
+            started = true;
+            follow_me::setup_calibration();
+            // The radar's target X/Y sensors, found by name
+            // (radar_x_name / radar_y_name, %d = target number).
+            for (int t = 0; t < follow_me::MAX_TRACKS; t++) {
+              char xn[64], yn[64];
+              snprintf(xn, sizeof(xn), "${radar_x_name}", t + 1);
+              snprintf(yn, sizeof(yn), "${radar_y_name}", t + 1);
+              for (auto *sens : App.get_sensors()) {
+                if (sens->get_name() == xn) follow_me::radar_x[t] = sens;
+                if (sens->get_name() == yn) follow_me::radar_y[t] = sens;
+              }
+              if (!follow_me::radar_x[t] || !follow_me::radar_y[t]) {
+                follow_me::radar_missing = true;
+                ESP_LOGE("follow_me", "No \"%s\" / \"%s\" sensor; set radar_x_name / radar_y_name", xn, yn);
+              }
+            }
+            for (auto *eff : id(follow_me_glow).get_effects()) {
+              const StringRef n = eff->get_name();
+              if (follow_me::fx::from_name(n.c_str(), n.size()) == follow_me::fx::NONE)
+                ESP_LOGE("follow_me", "Effect \"%s\" has no pattern in follow-me-effects.h", n.c_str());
+            }
+          }
+          follow_me::apply_pending();
+          follow_me::pause_when_on = id(follow_me_pause_on).state;
+
+          static uint32_t last_ms = 0;
+          static int zeros_sent = TRAILING_ZEROS;
+          follow_me::Track *tracks = follow_me::tracks;
+          const int MAX_TRACKS = follow_me::MAX_TRACKS;
+
+          const uint32_t now = millis();
+          float dt = last_ms == 0 ? 0.02f : (now - last_ms) / 1000.0f;
+          last_ms = now;
+          if (dt > 0.2f) dt = 0.2f;
+
+          static uint8_t data[follow_me::MAX_STREAM_LEDS * 4];
+          static uint8_t sent[sizeof(data)];
+          static int sent_len = 0;
+          static uint32_t sent_ip = 0, last_send = 0;
+          const bool net = network::is_connected();
+
+          // LED preview for the setup wizard: overrides everything else.
+          const int preview = follow_me::preview_now(now);
+          if (preview > 0) {
+            for (int i = 0; i < MAX_TRACKS; i++) tracks[i] = follow_me::Track();
+            zeros_sent = TRAILING_ZEROS;
+            const int leds = std::min(follow_me::wled_leds.load(), follow_me::MAX_STREAM_LEDS);
+            const uint32_t ip = follow_me::wled_ip.load();
+            if (!net || leds == 0 || ip == 0) return;
+            const int bpl = follow_me::wled_white.load() ? 4 : 3;
+            const int len = follow_me::preview_frame(data, leds, bpl, preview);
+            if (len == sent_len && ip == sent_ip && memcmp(data, sent, len) == 0 && now - last_send < KEEPALIVE_MS) return;
+            memcpy(sent, data, len);
+            sent_len = len;
+            sent_ip = ip;
+            last_send = now;
+            follow_me::send_ddp(ip, data, len, bpl);
+            return;
+          }
+
+          // Not set up, or WLED not found yet: send nothing.
+          const follow_me::Geometry &geo = follow_me::geo;
+          const int wled_leds = follow_me::wled_leds.load();
+          const uint32_t wled_ip = follow_me::wled_ip.load();
+          if (!geo.ready || wled_leds == 0 || wled_ip == 0) {
+            for (int i = 0; i < MAX_TRACKS; i++) tracks[i] = follow_me::Track();
+            zeros_sent = TRAILING_ZEROS;
+            return;
+          }
+          const bool white = follow_me::wled_white.load();
+          const int NUM_LEDS = std::min(wled_leds, follow_me::MAX_STREAM_LEDS);
+          const float *edge_wall = geo.edge_wall;
+          const float STEP = geo.inches_per_step;
+          const float WIDTH = 2.0f * geo.half_width;
+          const float STAIRS_TOP = 0.0f;                    // wall inches, top edge of the top step
+          const float STAIRS_BOTTOM = geo.stairs_bottom;    // wall inches, front of the bottom step
+          // People off the stairs within "Follow-Me Approach" steps of an end
+          // are followed, their window held at that end; farther out they
+          // are ignored.
+          float approach_steps = id(follow_me_approach).state;
+          if (std::isnan(approach_steps) || approach_steps < 0.0f) approach_steps = 0.0f;
+          const float APPROACH = approach_steps * STEP;
+          const float POS_MIN = STAIRS_TOP, POS_MAX = STAIRS_BOTTOM;
+          const float GATE = GATE_WIDTHS * WIDTH;
+          const float GATE_END = GATE_END_STEPS * STEP;
+          const float REARM = REARM_STEPS * STEP;
+          const float ENTRANCE_RANGE = std::min(ENTRANCE_STEPS * STEP, ENTRANCE_MAX_FRACTION * STAIRS_BOTTOM);
+          const float DUP_GAP = DUP_GAP_STEPS * STEP;
+          const float NL_EDGE = NL_EDGE_STEPS * STEP;
+          const float ASSOC_GATE = MAX_SPEED * ASSOC_JUMP_S;
+          // The lit range is the stairs; LEDs past either end stay dark. The
+          // strip's ends, for the night light and the entrance, are taken
+          // within it.
+          // Drawing happens in geo.edge_draw coordinates: wall inches with the
+          // strip's gaps squeezed out (follow-me-calibration.h), so a window
+          // crossing a gap lights both sides of it.
+          const float *edge_draw = geo.edge_draw;
+          const float DRAW_TOP = follow_me::draw_pos(STAIRS_TOP), DRAW_BOTTOM = follow_me::draw_pos(STAIRS_BOTTOM);
+          float strip_lo = edge_draw[0], strip_hi = edge_draw[0];
+          for (int k = 1; k <= NUM_LEDS; k++) {
+            strip_lo = fminf(strip_lo, edge_draw[k]);
+            strip_hi = fmaxf(strip_hi, edge_draw[k]);
+          }
+          const float STRIP_TOP_END = fmaxf(DRAW_TOP, strip_lo);
+          const float STRIP_BOTTOM_END = fminf(DRAW_BOTTOM, strip_hi);
+          // The same ends in wall inches, for the entrance (tracking is in wall inches).
+          float wall_lo = edge_wall[0], wall_hi = edge_wall[0];
+          for (int k = 1; k <= NUM_LEDS; k++) {
+            wall_lo = fminf(wall_lo, edge_wall[k]);
+            wall_hi = fmaxf(wall_hi, edge_wall[k]);
+          }
+          const float ENTRY_TOP = fmaxf(STAIRS_TOP, wall_lo), ENTRY_BOTTOM = fminf(STAIRS_BOTTOM, wall_hi);
+          follow_me::fx::set_extent(STAIRS_BOTTOM);
+
+          // WLED is on and the pause switch is set: someone is using the
+          // light. Send nothing (not even dark frames, which would re-enter
+          // realtime mode) and start fresh when it turns off.
+          if (follow_me::pause_when_on.load() && follow_me::wled_on.load()) {
+            for (int i = 0; i < MAX_TRACKS; i++) tracks[i] = follow_me::Track();
+            zeros_sent = TRAILING_ZEROS;
+            return;
+          }
+
+          // Radar targets on the stairs path.
+          struct Det {
+            float p, raw, x, y;
+            bool used;
+          };
+          Det det[follow_me::MAX_TRACKS];
+          int nd = 0;
+          sensor::Sensor *const *xs = follow_me::radar_x, *const *ys = follow_me::radar_y;
+          for (int t = 0; t < MAX_TRACKS; t++) {
+            if (!xs[t] || !ys[t]) continue;
+            float x = xs[t]->get_raw_state(), y = ys[t]->get_raw_state();
+            if (std::isnan(x) || std::isnan(y)) continue;
+            x /= 25.4f;  // mm to inches
+            y /= 25.4f;
+            float p = 0.0f;
+            bool at_end = false;
+            const float near_d2 = follow_me::project(x, y, &p, &at_end);
+            const float gate = at_end ? GATE_END : GATE;
+            if (near_d2 > gate * gate) continue;
+            if (p < STAIRS_TOP - APPROACH || p > STAIRS_BOTTOM + APPROACH) continue;
+            const float raw = p;  // before clamping to the stairs
+            p = fminf(POS_MAX, fmaxf(POS_MIN, p));
+            det[nd++] = {p, raw, x, y, false};
+          }
+
+          // Match targets to windows.
+          const bool enabled = id(follow_me_glow).remote_values.is_on();
+          const bool multi = id(follow_me_multi).state;
+          const int slots = multi ? MAX_TRACKS : 1;
+          for (int i = 0; i < MAX_TRACKS; i++) tracks[i].found = false;
+          auto take = [&](follow_me::Track &tr, Det &d) {
+            tr.found = true;
+            tr.det_p = d.p;
+            tr.det_raw = d.raw;
+            tr.det_x = d.x;
+            tr.det_y = d.y;
+            d.used = true;
+          };
+          if (enabled) {
+            if (!multi) {
+              // One window: the target nearest it, or the first one.
+              int best = -1;
+              float best_d = 1e9f;
+              for (int j = 0; j < nd; j++) {
+                const float d = tracks[0].alive ? fabsf(det[j].p - tracks[0].target) : 0.0f;
+                if (d < best_d) {
+                  best_d = d;
+                  best = j;
+                }
+              }
+              if (best >= 0) take(tracks[0], det[best]);
+            } else {
+              // Nearest pairs first, within ASSOC_GATE.
+              for (int round = 0; round < MAX_TRACKS; round++) {
+                int bi = -1, bj = -1;
+                float bd = ASSOC_GATE;
+                for (int i = 0; i < slots; i++) {
+                  if (!tracks[i].alive || tracks[i].found) continue;
+                  for (int j = 0; j < nd; j++) {
+                    if (det[j].used) continue;
+                    const float d = fabsf(det[j].p - tracks[i].target);
+                    if (d <= bd) {
+                      bd = d;
+                      bi = i;
+                      bj = j;
+                    }
+                  }
+                }
+                if (bi < 0) break;
+                take(tracks[bi], det[bj]);
+              }
+              // New windows: near an end, clear of existing windows.
+              for (int j = 0; j < nd; j++) {
+                if (det[j].used) continue;
+                const bool near_end = det[j].raw >= STAIRS_BOTTOM - ENTRANCE_RANGE ||
+                                      det[j].raw <= STAIRS_TOP + ENTRANCE_RANGE;
+                if (!near_end) continue;
+                bool clear = true;
+                for (int i = 0; i < MAX_TRACKS; i++) {
+                  if (tracks[i].alive && fabsf(det[j].p - tracks[i].target) < DUP_GAP) clear = false;
+                }
+                if (!clear) continue;
+                for (int i = 0; i < slots; i++) {
+                  if (tracks[i].alive) continue;
+                  tracks[i] = follow_me::Track();
+                  tracks[i].alive = true;
+                  take(tracks[i], det[j]);
+                  break;
+                }
+              }
+            }
+          }
+
+          float smooth = id(follow_me_smoothness).state / 100.0f;
+          if (std::isnan(smooth)) smooth = 0.5f;
+          smooth = fminf(1.0f, fmaxf(0.0f, smooth));
+          const float alpha = 0.6f - 0.35f * smooth;           // filter gain on position
+          const float beta = alpha * alpha / (2.0f - alpha);   // filter gain on speed
+          const float glide = 0.08f + 0.27f * smooth;          // window easing time constant, s
+
+          const float length = fmaxf(1.0f, id(follow_me_window).state) * STEP;
+          const float margin = fmaxf(0.0f, id(follow_me_buffer).state) * STEP;
+          const float slack = fmaxf(0.0f, length / 2.0f - margin);  // free travel from centre
+          // "Follow-Me Offset": steps ahead of the person in the direction they
+          // walk (negative: behind), blended in with walking speed so a pause
+          // or a turn does not make the window jump.
+          float offset_steps = id(follow_me_offset).state;
+          if (std::isnan(offset_steps)) offset_steps = 0.0f;
+          auto lead_offset = [&](float v) { return offset_steps * STEP * fmaxf(-1.0f, fminf(1.0f, v / OFFSET_FULL_SPEED)); };
+          const float hold_s = id(follow_me_hold).state;
+          const uint32_t hold_ms = (uint32_t) ((std::isnan(hold_s) || hold_s < 0.0f ? 0.0f : hold_s) * 1000.0f);
+
+          float max_level = 0.0f;
+          for (int i = 0; i < MAX_TRACKS; i++) {
+            follow_me::Track &tr = tracks[i];
+            if (!tr.alive && tr.found) tr.alive = true;  // single-person window starting
+            if (!tr.alive) continue;
+
+            // Predict.
+            if (tr.tracking) {
+              tr.target += tr.est_v * dt;
+              if (now - tr.last_meas > STALE_MS) tr.est_v *= expf(-dt / 0.25f);
+            }
+
+            if (tr.found) {
+              if (!tr.tracking || tr.level <= 0.0f) {
+                // Start centred on the person.
+                tr.target = tr.det_p;
+                tr.est_v = 0.0f;
+                tr.last_z = tr.det_p;
+                tr.last_meas = now;
+                tr.centre = tr.det_p;
+                tr.limited = tr.det_p;
+                tr.pos = tr.det_p;
+              } else if (tr.det_p != tr.last_z) {
+                // Correct with a new radar frame.
+                float dtm = (now - tr.last_meas) / 1000.0f;
+                dtm = fminf(0.5f, fmaxf(0.05f, dtm));
+                const float r = tr.det_p - tr.target;
+                tr.target += alpha * r;
+                tr.est_v += beta * r / dtm;
+                tr.last_z = tr.det_p;
+                tr.last_meas = now;
+              }
+              tr.tracking = true;
+              tr.last_seen = now;
+            }
+            tr.est_v = fminf(MAX_SPEED, fmaxf(-MAX_SPEED, tr.est_v));
+
+            if (tr.found) {
+              const int side = tr.det_raw > STAIRS_BOTTOM ? 1 : (tr.det_raw < STAIRS_TOP ? -1 : 0);
+              if (side == 0) {
+                tr.on_stairs = true;
+                tr.exit_dir = 0;
+              } else if (tr.on_stairs) {
+                tr.on_stairs = false;
+                tr.exit_dir = side;
+                tr.exit_far = 0.0f;
+              }
+              if (tr.exit_dir != 0) {
+                // Lingering ends when the person heads back toward the stairs.
+                const int e = tr.exit_dir > 0 ? 0 : geo.points - 1;  // path starts on the lower floor
+                const float dist = hypotf(tr.det_x - geo.x[e], tr.det_y - geo.y[e]);
+                tr.exit_far = fmaxf(tr.exit_far, dist);
+                if (dist < tr.exit_far - REARM) tr.exit_dir = 0;
+              }
+            } else if (now - tr.last_seen > hold_ms) {
+              tr.on_stairs = false;
+              tr.exit_dir = 0;
+            }
+
+            const bool lit = enabled && i < slots && tr.tracking && tr.exit_dir == 0 &&
+                             (now - tr.last_seen) <= hold_ms;
+
+            if (lit && tr.level <= 0.0f) {
+              // Arrival near an end: enter from beyond that end of the strip.
+              const float half = length / 2.0f;
+              if (ENTRY_BOTTOM - tr.target <= ENTRANCE_RANGE) {
+                tr.pos = ENTRY_BOTTOM + half;
+                tr.entering = true;
+              } else if (tr.target - ENTRY_TOP <= ENTRANCE_RANGE) {
+                tr.pos = ENTRY_TOP - half;
+                tr.entering = true;
+              }
+              tr.ent_v = 0.0f;
+              tr.ent_start = now;
+            }
+            if (!lit) tr.entering = false;
+            const float fade_in = tr.entering ? ENTRANCE_FADE : fmaxf(0.1f, id(follow_me_fade_in).state);
+            const float fade_out = tr.exit_dir != 0 ? EXIT_FADE : fmaxf(0.1f, id(follow_me_fade_out).state);
+            tr.level = lit ? fminf(1.0f, tr.level + dt / fade_in) : fmaxf(0.0f, tr.level - dt / fade_out);
+            if (!lit && tr.level <= 0.0f) tr.tracking = false;
+
+            if (tr.tracking && tr.entering) {
+              // Entrance: underdamped spring toward the person, then hand over.
+              const float person = tr.target + tr.est_v * LEAD + lead_offset(tr.est_v);
+              const float acc = ENTRANCE_W * ENTRANCE_W * (person - tr.pos) - 2.0f * ENTRANCE_ZETA * ENTRANCE_W * tr.ent_v;
+              tr.ent_v += acc * dt;
+              tr.pos += tr.ent_v * dt;
+              if (now - tr.ent_start > ENTRANCE_MAX_MS || (fabsf(person - tr.pos) < 0.5f && fabsf(tr.ent_v) < 2.0f)) {
+                tr.entering = false;
+                tr.centre = tr.pos;
+                tr.limited = tr.pos;
+              }
+            } else if (tr.tracking) {
+              // Window centre moves only when the person pushes past the slack.
+              const float person = tr.target + tr.est_v * LEAD + lead_offset(tr.est_v);
+              const float e = person - tr.centre;
+              if (fabsf(e) > slack) tr.centre = person - copysignf(slack, e);
+              const float step = MAX_SPEED * dt;
+              tr.limited += fminf(step, fmaxf(-step, tr.centre - tr.limited));
+              tr.pos += (tr.limited - tr.pos) * (1.0f - expf(-dt / glide));
+            }
+
+            // Free the slot once dark and out of sight.
+            if (!tr.tracking && now - tr.last_seen > hold_ms) tr.alive = false;
+            max_level = fmaxf(max_level, tr.level);
+          }
+
+          if (!net) return;
+
+          const float nl[4] = {id(nl_red) * 255.0f, id(nl_green) * 255.0f, id(nl_blue) * 255.0f,
+                               id(nl_white) * 255.0f};
+          const bool nl_on = nl[0] > 0.0f || nl[1] > 0.0f || nl[2] > 0.0f || nl[3] > 0.0f;
+          if (max_level <= 0.0f && !nl_on) {
+            if (zeros_sent >= TRAILING_ZEROS) return;
+            zeros_sent++;
+          } else {
+            zeros_sent = 0;
+          }
+
+          // Frame: 4 bytes per LED (RGBW) or 3 (RGB), sent over DDP.
+          // LED i covers the wall span between edges i and i + 1; its
+          // brightness is the largest fraction of that span inside any window,
+          // so only the end LEDs of a window are partial.
+          const int bpl = white ? 4 : 3;
+          const int frame_len = NUM_LEDS * bpl;
+          memset(data, 0, frame_len);
+          const float *white_mix = WHITE_MIX[std::min<size_t>(id(follow_me_rgb_white).active_index().value_or(1), 2)];
+          const float peak[4] = {id(fm_red) * 255.0f, id(fm_green) * 255.0f, id(fm_blue) * 255.0f,
+                                 id(fm_white) * 255.0f};
+          // Follow-Me Glow effect: replaces the colour with a per-LED pattern
+          // at the light's brightness (transitions included).
+          const StringRef fx_name = id(follow_me_glow).get_effect_name();
+          const follow_me::fx::Effect effect = follow_me::fx::from_name(fx_name.c_str(), fx_name.size());
+          const LightColorValues &glow_now = id(follow_me_glow).current_values;
+          const float fx_peak = glow_now.get_state() * glow_now.get_brightness() * 255.0f;
+          const float fx_t = (now % 86400000u) / 1000.0f;  // wraps daily so float seconds keep ms resolution
+          // Each window's lit span; leaving windows shrink toward the end the
+          // person left by.
+          float win_lo[MAX_TRACKS], win_hi[MAX_TRACKS], win_eased[MAX_TRACKS];
+          for (int k = 0; k < MAX_TRACKS; k++) {
+            const follow_me::Track &tr = tracks[k];
+            win_eased[k] = tr.level * tr.level * (3.0f - 2.0f * tr.level);  // smoothstep
+            const float centre = follow_me::draw_pos(tr.pos);
+            float lo = centre - length / 2.0f;
+            float hi = fminf(DRAW_BOTTOM, centre + length / 2.0f);
+            lo = fmaxf(lo, fminf(DRAW_TOP, hi));
+            if (tr.exit_dir > 0) {
+              lo = hi - (hi - lo) * tr.level;
+            } else if (tr.exit_dir < 0) {
+              lo = fmaxf(lo, STRIP_TOP_END);
+              hi = lo + (hi - lo) * tr.level;
+            }
+            win_lo[k] = lo;
+            win_hi[k] = hi;
+          }
+          const float nl_len = fmaxf(0.5f, id(follow_me_night_light_size).state) * STEP;
+          const float nl_edge = fminf(NL_EDGE, nl_len);
+          for (int i = 0; i < NUM_LEDS; i++) {
+            const float a = fminf(edge_draw[i], edge_draw[i + 1]), b = fmaxf(edge_draw[i], edge_draw[i + 1]);
+            float c = 0.0f;
+            int lit_by = 0;  // window giving this LED its brightness
+            for (int k = 0; k < MAX_TRACKS; k++) {
+              if (win_eased[k] <= 0.0f) continue;
+              const float cover = (fminf(win_hi[k], b) - fmaxf(win_lo[k], a)) / (b - a);
+              if (cover > 0.0f && fminf(1.0f, cover) * win_eased[k] > c) {
+                c = fminf(1.0f, cover) * win_eased[k];
+                lit_by = k;
+              }
+            }
+            // Night light patch at each end of the strip.
+            float n = 0.0f;
+            const float mid = 0.5f * (a + b);
+            const float wall_mid = 0.5f * (edge_wall[i] + edge_wall[i + 1]);  // effects are laid out in wall inches
+            if (nl_on && mid >= DRAW_TOP && mid <= DRAW_BOTTOM) {
+              const float d = fminf(mid - STRIP_TOP_END, STRIP_BOTTOM_END - mid);  // inches from the nearer end
+              if (d <= nl_len - nl_edge) {
+                n = 1.0f;
+              } else if (d < nl_len) {
+                const float f = (d - (nl_len - nl_edge)) / nl_edge;  // 0 at the patch, 1 at its edge
+                n = powf(0.5f + 0.5f * cosf(3.14159265f * f), GAMMA);
+              }
+            }
+            if (c <= 0.0f && n <= 0.0f) continue;
+            const float g = c > 0.0f ? powf(c, GAMMA) : 0.0f;
+            float led_peak[4] = {peak[0], peak[1], peak[2], peak[3]};
+            if (effect != follow_me::fx::NONE && c > 0.0f) {
+              const follow_me::fx::Rgbw col =
+                  follow_me::fx::paint(effect, i, wall_mid, fx_t, tracks[lit_by].pos, length);
+              led_peak[0] = col.r * fx_peak;
+              led_peak[1] = col.g * fx_peak;
+              led_peak[2] = col.b * fx_peak;
+              led_peak[3] = col.w * fx_peak;
+            }
+            float v[4];
+            for (int ch = 0; ch < 4; ch++) v[ch] = fmaxf(led_peak[ch] * g, nl[ch] * n);
+            if (!white)
+              for (int ch = 0; ch < 3; ch++) v[ch] += v[3] * white_mix[ch];
+            for (int ch = 0; ch < bpl; ch++) {
+              const int q = (int) lroundf(v[ch]);
+              data[i * bpl + ch] = (uint8_t) (q > 255 ? 255 : q);
+            }
+          }
+          // Send only frames that changed, plus a keepalive.
+          if (frame_len == sent_len && wled_ip == sent_ip && memcmp(data, sent, frame_len) == 0 &&
+              now - last_send < KEEPALIVE_MS)
+            return;
+          memcpy(sent, data, frame_len);
+          sent_len = frame_len;
+          sent_ip = wled_ip;
+          last_send = now;
+          follow_me::send_ddp(wled_ip, data, frame_len, bpl);

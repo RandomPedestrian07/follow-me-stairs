@@ -1,0 +1,58 @@
+# Apollo MTR-1 with the follow-me stair light.
+#
+# Apollo's stock MTR-1 configuration (pulled from Apollo's repository at a
+# fixed release) plus the follow-me package from this repository. Put this
+# file in the ESPHome config folder with this repository checked out beside it
+# as follow-me-stairs/, add wifi_ssid and wifi_password to secrets.yaml, and
+# install. Then open http://<device>/followme (or the "Set up Follow-Me"
+# button on the device's web page) to run the setup wizard.
+#
+# The name keeps Apollo's MAC suffix, so a device already adopted in Home
+# Assistant keeps its entities.
+
+substitutions:
+  name: apollo-mtr-1
+  version: "26.3.2.1"
+  follow_me_dir: follow-me-stairs/firmware
+
+esphome:
+  name: "${name}"
+  friendly_name: Apollo MTR-1
+  comment: Apollo MTR-1
+  name_add_mac_suffix: true
+  project:
+    name: "ApolloAutomation.MTR-1"
+    version: "${version}"
+  min_version: 2026.8.2
+  on_boot:
+    - priority: 500
+      then:
+        - text_sensor.template.publish:
+            id: apollo_firmware_version
+            state: "${version}"
+    - priority: -10
+      then:
+        - if:
+            condition:
+              - lambda: "return id(runTest);"
+            then:
+              - lambda: "id(testScript).execute();"
+
+logger:
+
+ota:
+  - platform: esphome
+    id: ota_default
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "Apollo MTR1 Hotspot"
+
+captive_portal:
+
+packages:
+  core: github://ApolloAutomation/MTR-1/Integrations/ESPHome/Core.yaml@26.3.2.1
+  follow_me: !include follow-me-stairs/firmware/follow-me.yaml

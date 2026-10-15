@@ -1,0 +1,1715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Follow-Me Setup</title>
+<!--
+  Follow-Me setup wizard.
+
+  Data: radar targets from the sensor's /followme/targets (raw, polled about
+  8/s while the page is open), and the follow-me settings and device name
+  from the web server's event stream (/events). Device address: ?host=, else
+  the page's own origin when the sensor serves it (meta followme-on-device),
+  else the last address entered in the address bar. ?sim=1 starts the
+  simulated walker. The LD2450 reports x mirrored; x is negated on arrival
+  and again when saving.
+
+  State: kept per sensor address in localStorage. Nothing about the stairs is
+  pre-picked; Next stays off until each screen is answered.
+
+  Sensor: on connect the stored setup is read from /followme/calibration.
+  When its wizard state differs from this page's, it is loaded, or offered
+  when this page has unsaved changes. "Save to sensor" (end of the strip
+  match) posts the calibration and the wizard state there. While the strip
+  match is open, /followme/preview lights the chosen LED on the strip. The
+  Test screen's sliders are the sensor's Follow-Me number entities, set
+  through the web server's number endpoints, with their ranges from the
+  event stream.
+
+  WLED: "Read" takes the LED count and strip type from /json/info and checks
+  the realtime settings in /json/cfg that follow-me relies on; "Fix WLED
+  settings" writes the ones that are off.
+
+  Screens: shape (straight, L, U; upper and lower floor can be flipped),
+  step counts, stair width and units, strip wall and LED 1 end, walk, strip
+  match, test walk.
+
+  Walk: taps at the lower floor (start), the first step, the last step before
+  the landing and the first step after it (L and U), the last step, and on
+  the upper floor. Step taps are tread middles. The trail is fitted with one
+  line (straight) or two lines (L, U); the stairs' centre line is rebuilt from
+  the fit (L corner = line intersection, U landing = end of the first flight
+  projected onto the second). Each flight's tread run comes from its taps and
+  step count; the flight starts half a run before its first tap and ends half
+  a run after its last. During the walk each tap is an anchor and the live
+  dot follows a line through the samples since it, once past a deadband.
+
+  Drawing: everything is drawn on the template stairs; radar points are
+  translated by matching distance along the stairs feature to feature
+  (floor, first step, landing edges, last step, floor) and keeping the
+  sideways offset (mirrored when the walk turns the other way from the stairs
+  as described). The sensor is drawn where the radar's origin falls. LED pins
+  are those features; the glow is tracked in radar distances and drawn on the
+  template strip wall.
+
+  Fonts: IBM Plex from fonts/ (SIL OFL 1.1).
+-->
+<style>
+/* IBM Plex (SIL OFL 1.1, fonts/OFL.txt), Latin subset. Inlined when the sensor serves the page. */
+@font-face{font-family:"IBM Plex Sans";font-weight:100 700;font-display:swap;src:url(fonts/plex-sans.woff2) format("woff2")}
+@font-face{font-family:"IBM Plex Mono";font-weight:400;font-display:swap;src:url(fonts/plex-mono-400.woff2) format("woff2")}
+@font-face{font-family:"IBM Plex Mono";font-weight:500 600;font-display:swap;src:url(fonts/plex-mono-500.woff2) format("woff2")}
+:root{
+  --bg:#0a0a0b; --panel:#0e0e10;
+  --ink:#ece8df; --ink-2:rgba(236,232,223,.62); --ink-3:rgba(236,232,223,.36); --ink-4:rgba(236,232,223,.14);
+  --line:rgba(236,232,223,.1); --line-2:rgba(236,232,223,.2);
+  --warm:#ffb35a; --warm-2:#ffd6a0;
+  --bad:#ff8a7a;
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink)}
+body{font:15px/1.5 var(--sans);-webkit-font-smoothing:antialiased;min-height:100dvh}
+button,input{font:inherit;color:inherit}
+.mono{font-family:var(--mono)}
+
+/* header */
+.top{display:flex;align-items:center;gap:14px;padding:max(14px,env(safe-area-inset-top)) 20px 12px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:baseline;gap:12px;min-width:0}
+.brand b{font:500 12px/1 var(--mono);letter-spacing:.18em}
+.brand span{font:12px/1 var(--mono);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top .sp{flex:1}
+.sim{display:flex;align-items:center;gap:7px;font:11px/1 var(--mono);letter-spacing:.12em;color:var(--ink-3);cursor:pointer;user-select:none}
+.sim input{appearance:none;width:12px;height:12px;border:1px solid var(--ink-3);margin:0;border-radius:2px;display:grid;place-items:center}
+.sim input:checked{border-color:var(--warm);background:var(--warm)}
+.live{display:flex;align-items:center;gap:7px;font:11px/1 var(--mono);letter-spacing:.12em;color:var(--ink-3)}
+.live i{width:6px;height:6px;border-radius:50%;background:var(--ink-4)}
+.live.on i{background:var(--ink);box-shadow:0 0 8px var(--ink)}
+.live.sim i{background:var(--warm);box-shadow:0 0 8px var(--warm)}
+.live.off i{background:var(--bad)}
+
+/* sensor address bar */
+.hostbar{position:fixed;left:0;right:0;top:47px;z-index:5;display:flex;align-items:flex-end;gap:12px;padding:12px 20px 14px;
+  background:var(--bg);border-bottom:1px solid var(--line)}
+.hostbar[hidden]{display:none}
+.hostbar .field{flex:1;max-width:340px}
+.hostnote{font-size:13px;color:var(--warm-2);align-self:center}
+.live{cursor:pointer}
+
+/* stage */
+.stage{display:grid;grid-template-columns:minmax(0,1fr) 400px;height:calc(100dvh - 47px - 73px)}
+.draw{position:relative;background:var(--panel);border-right:1px solid var(--line);overflow:hidden;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:32px 32px;background-position:-1px -1px}
+.draw::before{content:"";position:absolute;inset:0;background:radial-gradient(ellipse at center,transparent 40%,rgba(10,10,11,.85) 100%);pointer-events:none}
+.draw canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.draw .crop{position:absolute;width:14px;height:14px;border-color:var(--ink-3);border-style:solid;border-width:0;pointer-events:none}
+.crop.tl{left:12px;top:12px;border-left-width:1px;border-top-width:1px}
+.crop.tr{right:12px;top:12px;border-right-width:1px;border-top-width:1px}
+.crop.bl{left:12px;bottom:12px;border-left-width:1px;border-bottom-width:1px}
+.crop.br{right:12px;bottom:12px;border-right-width:1px;border-bottom-width:1px}
+.readout{position:absolute;right:20px;top:18px;font:11px/1.6 var(--mono);color:var(--ink-3);letter-spacing:.06em;text-align:right;pointer-events:none}
+.stripbox{position:absolute;left:20px;right:20px;bottom:18px;height:60px;pointer-events:none}
+.stripbox canvas{position:static;width:100%;height:100%}
+
+/* question column */
+.q{padding:28px 28px 40px;overflow:auto}
+.kicker{font:11px/1 var(--mono);letter-spacing:.16em;color:var(--ink-3);margin-bottom:14px}
+.kicker em{font-style:normal;color:var(--ink)}
+.q h1{font:600 26px/1.15 var(--sans);letter-spacing:-.015em;margin:0 0 10px}
+.q .help{color:var(--ink-2);margin:0 0 22px;font-size:14.5px}
+.fine{font-size:12.5px;color:var(--ink-3);margin-top:16px}
+.group{font:11px/1 var(--mono);letter-spacing:.16em;color:var(--ink-3);margin:22px 0 8px}
+
+/* option rows */
+.opts{border-top:1px solid var(--line)}
+.opt{display:flex;align-items:center;gap:14px;width:100%;padding:13px 2px;background:none;border:0;border-bottom:1px solid var(--line);
+  text-align:left;cursor:pointer;color:var(--ink-2)}
+.opt svg{width:22px;height:28px;flex:none;fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:square;opacity:.7}
+.opt span{flex:1;display:flex;flex-direction:column}
+.opt b{font-weight:500;color:var(--ink-2)}
+.opt small{font-size:12.5px;color:var(--ink-3)}
+.opt i{width:10px;height:10px;border:1px solid var(--ink-3);flex:none;transform:rotate(45deg)}
+.opt:hover b{color:var(--ink)}
+.opt.sel b{color:var(--ink)}
+.opt.sel svg{opacity:1;color:var(--ink)}
+.opt.sel i{background:var(--warm);border-color:var(--warm);box-shadow:0 0 10px rgba(255,179,90,.6)}
+.opt .val{font:13px/1 var(--mono);color:var(--ink-3)}
+.opt.sel .val{color:var(--warm-2)}
+
+/* steppers */
+.num{display:flex;align-items:center;padding:12px 2px;border-bottom:1px solid var(--line)}
+.num:first-child{border-top:1px solid var(--line)}
+.num label{flex:1;color:var(--ink-2)}
+.num .ctl{display:flex;align-items:center}
+.num button{width:34px;height:34px;border:1px solid var(--line-2);background:none;cursor:pointer;font:16px/1 var(--mono);color:var(--ink-2)}
+.num button:hover{border-color:var(--ink-3);color:var(--ink)}
+.num output{width:70px;text-align:center;font:500 18px/1 var(--mono);font-variant-numeric:tabular-nums}
+.num output small{font-size:11px;color:var(--ink-3);margin-left:3px}
+
+/* buttons */
+.go{display:inline-flex;align-items:center;justify-content:center;gap:10px;border:0;background:var(--ink);color:#111;
+  padding:13px 18px;font:500 14px/1 var(--sans);letter-spacing:.01em;cursor:pointer;border-radius:3px}
+.go:hover{background:#fff}
+.go:disabled{background:var(--ink-4);color:var(--ink-3);cursor:default}
+.go.wide{width:100%;padding:16px}
+.go.rec{background:var(--warm);color:#1b1006}
+.line{border:1px solid var(--line-2);background:none;padding:11px 16px;cursor:pointer;border-radius:3px;color:var(--ink-2);font-size:14px}
+.line:hover{border-color:var(--ink-3);color:var(--ink)}
+.line:disabled{opacity:.4;cursor:default}
+.ghost{border:0;background:none;color:var(--ink-2);cursor:pointer;padding:12px 6px;font-size:14px}
+.ghost:hover{color:var(--ink)}
+.row{display:flex;gap:8px;align-items:center}
+.warn{border-left:2px solid var(--warm);padding:6px 0 6px 12px;margin:10px 0;font-size:13px;color:var(--warm-2)}
+.verdict{font:600 17px/1.3 var(--sans);color:var(--ink);margin:0 0 14px}
+.verdict.bad{color:var(--warm)}
+.stretches{border-top:1px solid var(--line)}
+.stretch{display:grid;grid-template-columns:22px 1fr auto;align-items:baseline;padding:11px 2px;border-bottom:1px solid var(--line);color:var(--ink-2)}
+.stretch i{font:600 13px/1 var(--mono);font-style:normal;color:var(--ink-3)}
+.stretch .val{font:13px/1 var(--mono);color:var(--ink-3)}
+.stretch small{grid-column:2/4;font-size:12.5px;color:var(--warm-2);margin-top:5px}
+.stretch.bad i,.stretch.bad b{color:var(--warm)}
+.stretch b{font-weight:500}
+.raw{margin-top:18px}
+.raw summary{cursor:pointer;font:11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);padding:6px 0}
+.raw summary:hover{color:var(--ink-2)}
+.raw pre{font:11px/1.5 var(--mono);color:var(--ink-2);background:rgba(255,255,255,.03);border:1px solid var(--line);
+  padding:10px;margin:8px 0 10px;overflow-x:auto;white-space:pre;user-select:text;-webkit-user-select:text}
+
+/* led picker */
+.ledpick{display:flex;align-items:center;gap:6px;margin:18px 0 6px}
+.ledpick .big{flex:1;text-align:center;font:500 34px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.ledpick .big small{display:block;font-size:10px;letter-spacing:.16em;color:var(--ink-3);margin-top:6px}
+.ledpick button{width:44px;height:38px;border:1px solid var(--line-2);background:none;cursor:pointer;font:12px/1 var(--mono);color:var(--ink-2)}
+.ledpick button:hover{border-color:var(--ink-3);color:var(--ink)}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:30px;background:none;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:1px;background:var(--line-2)}
+input[type=range]::-moz-range-track{height:1px;background:var(--line-2)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;margin-top:-7px;background:var(--bg);border:1px solid var(--ink);transform:rotate(45deg)}
+input[type=range]::-moz-range-thumb{width:12px;height:12px;background:var(--bg);border:1px solid var(--ink);border-radius:0}
+.field{display:flex;flex-direction:column;gap:6px;font:11px/1 var(--mono);letter-spacing:.14em;color:var(--ink-3)}
+.input{background:none;border:0;border-bottom:1px solid var(--line-2);padding:8px 0;outline:none;font:14px/1.2 var(--mono);color:var(--ink);letter-spacing:0;min-width:0;width:100%}
+.input:focus{border-color:var(--ink-2)}
+.tbl{font:12.5px/1.65 var(--mono);color:var(--ink-2);margin:8px 0 10px;padding:10px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);white-space:pre;overflow-x:auto;user-select:text;-webkit-user-select:text}
+.tbl b{color:var(--ink-3);font-weight:400}
+.tune{margin:4px 0 6px}
+.tune .t{display:flex;justify-content:space-between;font-size:13.5px;color:var(--ink-2)}
+.tune .t b{font:500 13px var(--mono);color:var(--ink)}
+
+/* footer */
+.bar{position:fixed;left:0;right:0;bottom:0;height:73px;display:flex;align-items:center;gap:14px;padding:0 20px env(safe-area-inset-bottom);
+  border-top:1px solid var(--line);background:rgba(10,10,11,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);z-index:5}
+.prog{flex:1;display:flex;flex-direction:column;gap:7px;align-items:center}
+.prog .count{font:11px/1 var(--mono);letter-spacing:.16em;color:var(--ink-3)}
+.prog .ticks{display:flex;gap:4px}
+.prog .ticks i{width:18px;height:2px;background:var(--ink-4)}
+.prog .ticks i.done{background:var(--ink-3)}
+.prog .ticks i.on{background:var(--ink)}
+.toast{position:fixed;left:50%;bottom:88px;transform:translate(-50%,8px);opacity:0;background:var(--ink);color:#111;padding:10px 14px;
+  font-size:13.5px;border-radius:3px;transition:.2s;pointer-events:none;z-index:9;white-space:nowrap}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+
+@media (max-width:820px){
+  .stage{display:block;height:auto}
+  .draw{height:min(56vh,520px);border-right:0;border-bottom:1px solid var(--line)}
+  .q{padding:22px 16px 110px;overflow:visible}
+  .q h1{font-size:23px}
+  .top{padding-left:16px;padding-right:16px}
+  .bar{padding-left:12px;padding-right:12px}
+  .brand span{display:none}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><b>FOLLOW-ME</b><span id="dev">connecting</span></div>
+  <div class="sp"></div>
+  <label class="sim"><input type="checkbox" id="simToggle">SIM</label>
+  <div class="live off" id="live"><i></i><span id="liveTxt">OFFLINE</span></div>
+</header>
+
+<div class="hostbar" id="hostbar" hidden>
+  <label class="field">SENSOR ADDRESS<input class="input" id="hostInput" placeholder="192.168.1.60" autocomplete="off" spellcheck="false"></label>
+  <button class="line" id="hostGo" style="padding:8px 14px">Connect</button>
+  <span class="hostnote" id="hostNote"></span>
+</div>
+<div class="hostbar" id="loadbar" hidden>
+  <span class="hostnote" style="flex:1">This sensor has a saved setup that differs from this page. Load it? Your unsaved changes here are replaced.</span>
+  <button class="line" id="loadYes" style="padding:8px 14px">Load it</button>
+  <button class="ghost" id="loadNo">Keep mine</button>
+</div>
+
+<main class="stage">
+  <div class="draw" id="draw">
+    <canvas id="cv"></canvas>
+    <div class="crop tl"></div><div class="crop tr"></div><div class="crop bl"></div><div class="crop br"></div>
+    <div class="readout" id="readout"></div>
+    <div class="stripbox" id="stripbox" hidden><canvas id="strip"></canvas></div>
+  </div>
+  <aside class="q">
+    <div class="kicker" id="kicker"></div>
+    <h1 id="title"></h1>
+    <p class="help" id="help"></p>
+    <div id="body"></div>
+  </aside>
+</main>
+
+<footer class="bar">
+  <button class="ghost" id="back">← Back</button>
+  <div class="prog"><div class="count" id="count"></div><div class="ticks" id="ticks"></div></div>
+  <button class="go" id="next">Next →</button>
+</footer>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+'use strict';
+
+const KEY = 'followme-wizard-v3';
+const IN = 25.4;
+const RUN = 254;          // tread run used to draw the template before a walk, mm
+const GAP = 150;          // gap between U flights in the template drawing, mm
+const SAMPLE_HZ = 6;      // simulated radar rate
+const TYPICAL_RUN = 260;  // tread run assumed for a one-step flight, mm (a walk cannot measure it)
+
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const add = (a, b) => ({x: a.x + b.x, y: a.y + b.y});
+const sub = (a, b) => ({x: a.x - b.x, y: a.y - b.y});
+const mul = (a, k) => ({x: a.x * k, y: a.y * k});
+const dot = (a, b) => a.x * b.x + a.y * b.y;
+const len = a => Math.hypot(a.x, a.y);
+const unit = (a, b) => { const d = sub(b, a), L = len(d) || 1; return {x: d.x / L, y: d.y / L}; };
+const rnorm = u => ({x: u.y, y: -u.x});          // right-hand side of walking direction u
+const pad2 = n => String(n).padStart(2, '0');
+const esc = v => String(v).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+
+// ---------- shapes ----------
+// The template is drawn one way round; S.reversed walks it from the other end,
+// which mirrors the turn (an L turning right going up turns left going down).
+const SHAPES = {
+  'straight': {label: 'Straight', sub: 'One flight, no turn', kind: 'I', icon: 'M12 28V4'},
+  'L':        {label: 'L-shaped', sub: 'Two flights with a landing, turning a corner', kind: 'L', icon: 'M7 28V9h14'},
+  'U':        {label: 'U-shaped', sub: 'Switchback, flights side by side', kind: 'U', icon: 'M5 28V5h14v23'},
+};
+const FLOOR_DEPTH = 700;  // floor patch drawn beyond each end until a walk measures it, mm
+const FLOOR_STOP = 610;   // where the walk's last stop is drawn on the upper floor, mm
+const FEAT = {
+  'bottom':   {label: 'Front edge of the bottom step', tag: 'BOTTOM', required: true},
+  'land-in':  {label: 'Where the lower flight meets the landing', tag: 'LANDING'},
+  'land-out': {label: 'Where the landing meets the upper flight', tag: 'LANDING'},
+  'top':      {label: 'Top edge of the top step', tag: 'TOP', required: true},
+};
+const pinFeats = plan => plan.feats.filter(f => FEAT[f.key]);
+const SCREENS = [
+  {key: 'shape',  name: 'SHAPE',  title: 'What shape are your stairs?', help: 'Pick the closest match, then check the floor labels. If upper and lower are backwards, flip them.'},
+  {key: 'steps',  name: 'STEPS',  title: 'How many steps?', help: "Count the treads you step on in each flight. Don't count a landing or the floor at the top."},
+  {key: 'strip',  name: 'STRIP',  title: 'Where does the light run?', help: 'Pick the wall the strip is on, then say which end LED 1 is at.'},
+  {key: 'walk',   name: 'WALK',   title: 'Walk up the stairs', help: ''},
+  {key: 'match',  name: 'MATCH',  title: 'Line up the strip', help: 'For each mark, move the lit LED until it sits at that spot on your stairs.'},
+  {key: 'test',   name: 'TEST',   title: 'Take it for a walk', help: 'Walk the stairs and tune until the light feels right.'},
+];
+const SC = Object.fromEntries(SCREENS.map((s, i) => [s.key, i]));
+
+// ---------- units ----------
+// Imperial where the phone's region uses it, metric elsewhere; switchable on the steps screen.
+const IMPERIAL_REGIONS = ['US', 'LR', 'MM'];
+const defaultUnits = () => IMPERIAL_REGIONS.includes((navigator.language || '').split('-')[1]) ? 'imperial' : 'metric';
+const imperial = () => S.units === 'imperial';
+const fmtLen = mm => imperial() ? (mm >= 914 ? `${(mm / 304.8).toFixed(1)} ft` : `${Math.round(mm / IN)} in`) : (mm >= 1000 ? `${(mm / 1000).toFixed(1)} m` : `${Math.round(mm / 10)} cm`);
+
+// ---------- state ----------
+// Kept per sensor address in localStorage. Nothing is pre-picked: every
+// answer about the stairs comes from the person setting them up.
+const fresh = () => ({
+  screen: 0, shape: null, reversed: false, steps: null, width: null, units: defaultUnits(),
+  stripSide: null, stripStart: null,
+  cl: null, trail: [], marks: null, pins: {}, ledCount: null, ledWhite: null, wledHost: '', feat: 'bottom', cursor: 1,
+  tune: {}, rev: null, dirty: false,
+});
+const S = fresh();
+// Sensor address: ?host=, else the page's own origin when the sensor serves
+// it (marked by <meta name="followme-on-device">), else the last one entered.
+const ON_DEVICE = !!document.querySelector('meta[name="followme-on-device"]');
+function host() {
+  const q = new URLSearchParams(location.search).get('host');
+  if (q) return q;
+  if (ON_DEVICE) return location.host;
+  try { return localStorage.getItem(KEY + '-host') || ''; } catch (e) { return ''; }
+}
+const stateKey = () => `${KEY}:${host()}`;
+// Wizard state from storage or the sensor: only known keys with sane types.
+function sanitize(o) {
+  const out = {}, isPt = p => p && Number.isFinite(p.x) && Number.isFinite(p.y);
+  if (!o || typeof o !== 'object') return out;
+  if (SHAPES[o.shape]) out.shape = o.shape;
+  if (typeof o.reversed === 'boolean') out.reversed = o.reversed;
+  if (Array.isArray(o.steps) && o.steps.length >= 1 && o.steps.length <= 2 && o.steps.every(n => n == null || (Number.isInteger(n) && n >= 1 && n <= 40))) out.steps = o.steps;
+  if (Number.isFinite(o.width) && o.width >= 300 && o.width <= 2500) out.width = o.width;
+  if (o.units === 'imperial' || o.units === 'metric') out.units = o.units;
+  if (['inside', 'outside', 'left', 'right'].includes(o.stripSide)) out.stripSide = o.stripSide;
+  if (o.stripStart === 'bottom' || o.stripStart === 'top') out.stripStart = o.stripStart;
+  if (Array.isArray(o.cl) && o.cl.length >= 2 && o.cl.length <= 4 && o.cl.every(isPt)) out.cl = o.cl;
+  if (o.marks && typeof o.marks === 'object') {
+    const m = {};
+    for (const k of ['bottom', 'top', 'lastLower', 'firstUpper']) if (isPt(o.marks[k])) m[k] = o.marks[k];
+    if (m.bottom && m.top) out.marks = m;
+  }
+  if (o.pins && typeof o.pins === 'object') {
+    out.pins = {};
+    for (const k of Object.keys(FEAT)) if (Number.isInteger(o.pins[k]) && o.pins[k] >= 1 && o.pins[k] <= 1500) out.pins[k] = o.pins[k];
+  }
+  if (Number.isInteger(o.ledCount) && o.ledCount >= 1 && o.ledCount <= 1500) out.ledCount = o.ledCount;
+  if (typeof o.ledWhite === 'boolean') out.ledWhite = o.ledWhite;
+  if (typeof o.wledHost === 'string' && /^[A-Za-z0-9._-]{1,127}$/.test(o.wledHost)) out.wledHost = o.wledHost;
+  if (Number.isFinite(o.rev)) out.rev = o.rev;
+  if (Number.isInteger(o.screen)) out.screen = clamp(o.screen, 0, SCREENS.length - 1);
+  if (Array.isArray(o.trail) && o.trail.every(q => isPt(q) && Number.isFinite(q.t))) out.trail = o.trail;
+  if (o.feat in FEAT) out.feat = o.feat;
+  if (typeof o.dirty === 'boolean') out.dirty = o.dirty;
+  return out;
+}
+function loadLocal() {
+  Object.assign(S, fresh());
+  try { Object.assign(S, sanitize(JSON.parse(localStorage.getItem(stateKey())))); } catch (e) {}
+}
+// edit: false for saves that only mirror the sensor (loading, saving to it).
+const save = (edit = true) => { if (edit) S.dirty = true; try { localStorage.setItem(stateKey(), JSON.stringify(S)); } catch (e) {} };
+loadLocal();
+const shape = () => {
+  const sh = SHAPES[S.shape || 'straight'];
+  return Object.assign({}, sh, {turn: sh.kind === 'I' ? 0 : S.reversed ? -1 : 1});
+};
+// Values the drawing uses before the person has answered.
+const dispSteps = () => (shape().kind === 'I' ? [12] : [6, 6]).map((v, i) => (S.steps && S.steps[i]) || v);
+const stepsAnswered = () => !!S.steps && S.steps.length === (shape().kind === 'I' ? 1 : 2) && S.steps.every(n => n);
+const dispWidth = () => S.width || 900;
+// Flip changes which way the stairs turn going up. Answers about the real
+// stairs (step counts, strip wall, LED 1 end) and the walk stay as they are.
+function flip() {
+  S.reversed = !S.reversed;
+  save(); render();
+}
+// The strip wall: inside/outside of the turn (L, U) or left/right going up (straight).
+const insideSide = () => shape().turn < 0 ? 'left' : 'right';
+function stripSide() {
+  const v = S.stripSide;
+  if (shape().kind === 'I') return v === 'left' || v === 'right' ? v : null;
+  if (v === 'inside') return insideSide();
+  if (v === 'outside') return insideSide() === 'left' ? 'right' : 'left';
+  return null;
+}
+
+// ---------- live data ----------
+// Targets come from /followme/targets (raw, about 8/s, polled while the page
+// is open). Settings and the device name come from the web server's event
+// stream.
+const live = [null, null, null];
+let es = null, lastMsg = 0, stamps = [], newSample = false, failures = 0, pollGen = 0;
+function showHostBar(show, note = '') {
+  $('hostbar').hidden = !show;
+  $('hostNote').textContent = note;
+  if (show) { $('hostInput').value = host(); $('hostInput').focus(); }
+}
+function setHost(h) {
+  h = h.trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  if (!h) return;
+  try { localStorage.setItem(KEY + '-host', h); } catch (e) {}
+  const u = new URL(location.href);
+  if (u.searchParams.has('host')) { u.searchParams.set('host', h); history.replaceState(null, '', u); }
+  showHostBar(false);
+  loadLocal();
+  render();
+  connect();
+}
+$('hostGo').onclick = () => setHost($('hostInput').value);
+$('hostInput').onkeydown = e => { if (e.key === 'Enter') setHost($('hostInput').value); };
+$('live').onclick = () => showHostBar($('hostbar').hidden);
+function setTarget(i, x, y) {
+  // The LD2450 reports x mirrored; flip it so the drawing reads as seen from behind the sensor.
+  live[i] = x === 0 && y === 0 ? null : {x: -x, y};
+}
+async function pollTargets(gen, h) {
+  while (gen === pollGen) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`http://${h}/followme/targets`, {cache: 'no-store'});
+      if (!r.ok) return;   // firmware without the endpoint: the event stream's 1/s targets are used
+      const j = await r.json();
+      if (gen !== pollGen) return;
+      j.targets.forEach((t, i) => { if (t) setTarget(i, t[0], t[1]); else live[i] = null; });
+      fastTargets = true; lastMsg = Date.now(); stamps.push(Date.now()); newSample = true;
+    } catch (e) { fastTargets = false; }
+    await new Promise(res => setTimeout(res, Math.max(20, 125 - (Date.now() - t0))));
+  }
+}
+let fastTargets = false;
+function connect() {
+  if (es) es.close();
+  es = null; pollGen++; fastTargets = false;
+  const h = host();
+  if (!h) { $('dev').textContent = 'no sensor'; if (!$('simToggle').checked && !new URLSearchParams(location.search).has('sim')) showHostBar(true); return; }
+  try { localStorage.setItem(KEY + '-host', h); } catch (e) {}
+  $('dev').textContent = h;
+  es = new EventSource(`http://${h}/events`);
+  let first = true;
+  es.addEventListener('ping', ev => {
+    lastMsg = Date.now(); failures = 0;
+    if (first) { first = false; loadFromSensor(); pollTargets(pollGen, h); }
+    try { $('dev').textContent = JSON.parse(ev.data).title || h; } catch (e) {}
+  });
+  es.addEventListener('state', ev => {
+    lastMsg = Date.now();
+    let d; try { d = JSON.parse(ev.data); } catch (e) { return; }
+    const knob = Object.keys(KNOBS).find(k => d.id === 'number/' + KNOBS[k]);
+    if (knob) { devKnob(knob, d); return; }
+    if (d.id === 'switch/Follow-Me Pause While WLED On') { pauseWhenOn = d.value !== false; return; }
+    if (fastTargets) return;
+    const m = /^sensor\/Target-([123]) ([XY])$/.exec(d.id || '');
+    if (!m) return;
+    const i = +m[1] - 1, axis = m[2];
+    if (d.value == null) { live[i] = null; return; }
+    const cur = live[i] ? {x: -live[i].x, y: live[i].y} : {x: 0, y: 0};
+    cur[axis.toLowerCase()] = d.value;
+    setTarget(i, cur.x, cur.y);
+    if (axis === 'Y') { stamps.push(Date.now()); newSample = true; }
+  });
+  // ESPHome asks for a 30 s retry; reconnect sooner. After a few failures
+  // the address bar opens in case the address is wrong.
+  es.onerror = () => {
+    es.close(); es = null; pollGen++;
+    if (++failures === 3) showHostBar(true, `Can't reach a sensor at ${h}. Check the address.`);
+    setTimeout(connect, 2000);
+  };
+}
+
+// ---------- sensor: stored setup, settings, LED preview ----------
+// The Test screen's sliders are the sensor's own settings (number entities);
+// their ranges come from the sensor too.
+const KNOBS = {window: 'Follow-Me Window', buffer: 'Follow-Me Buffer', smooth: 'Follow-Me Smoothness', hold: 'Follow-Me Hold', offset: 'Follow-Me Offset', approach: 'Follow-Me Approach'};
+const knobRange = {};
+let pauseWhenOn = true;
+// Wizard state stored on the sensor with the calibration (no walk samples).
+const WIZ_KEYS = ['rev', 'shape', 'reversed', 'steps', 'width', 'units', 'stripSide', 'stripStart', 'cl', 'marks', 'pins', 'ledCount', 'ledWhite', 'wledHost'];
+const WIZ_MAX = 1500;  // bytes; the sensor stores up to 1535
+let canSave = null;    // null: not known yet; false: this sensor's firmware has no setup endpoint
+const devLive = () => !simOn() && !!host() && Date.now() - lastMsg < 20000;
+function devKnob(k, d) {
+  if (Number.isFinite(d.min_value)) knobRange[k] = {min: d.min_value, max: d.max_value, step: d.step};
+  if (d.value == null || !Number.isFinite(+d.value)) return;
+  S.tune[k] = +d.value; save(false);
+  const r = document.querySelector(`[data-tune="${k}"]`);
+  if (r && document.activeElement !== r) { r.value = S.tune[k]; r.dispatchEvent(new Event('show')); }
+}
+const knobTimers = {};
+function setKnob(k, v) {
+  if (!devLive()) return;
+  clearTimeout(knobTimers[k]);
+  knobTimers[k] = setTimeout(() => {
+    fetch(`http://${host()}/number/${encodeURIComponent(KNOBS[k])}/set?value=${v}`, {method: 'POST'}).catch(() => toast('Could not reach the sensor'));
+  }, 150);
+}
+let sensorSetup = null;   // the wizard state saved on the sensor, when it differs from this page's
+async function loadFromSensor() {
+  const h = host();
+  if (!h || simOn()) return;
+  try {
+    const r = await fetch(`http://${h}/followme/calibration`, {cache: 'no-store'});
+    if (r.status === 404) { canSave = false; return; }
+    if (!r.ok) return;
+    canSave = true;
+    const j = await r.json();
+    const w = j.set ? sanitize(j.wizard) : null;
+    if (!w || !w.rev || w.rev === S.rev) return;
+    if (!S.dirty && !rec) applySensorSetup(w);
+    else { sensorSetup = w; $('loadbar').hidden = false; }
+  } catch (e) { /* unreachable for now; the next connect tries again */ }
+}
+// A blank wizard. Marked as edited, so the setup saved on the sensor is
+// offered rather than loaded over it on the next connect.
+function startOver() {
+  stopPreview();
+  Object.assign(S, fresh(), {units: S.units, rev: S.rev, dirty: true});
+  save(); render();
+  toast('Starting over. The sensor keeps its setup until you save.');
+}
+function applySensorSetup(w) {
+  Object.assign(S, fresh(), {units: S.units}, w, {trail: [], screen: S.screen, dirty: false});
+  if (S.screen > SC.walk && !S.cl) S.screen = SC.walk;
+  save(false); render();
+  toast('Loaded the setup saved on this sensor');
+}
+$('loadYes').onclick = () => { $('loadbar').hidden = true; if (sensorSetup) applySensorSetup(sensorSetup); sensorSetup = null; };
+$('loadNo').onclick = () => { $('loadbar').hidden = true; sensorSetup = null; };
+const cleanHost = h => h.trim().replace(/^https?:\/\//, '').replace(/[/:].*$/, '');
+
+// LED preview: while the match screen is open the sensor lights the chosen
+// LED on the strip, through the same stream follow-me uses.
+let previewTimer = null, previewOn = false;
+function postPreview(led) {
+  if (!devLive() || canSave === false || !S.wledHost) return;
+  fetch(`http://${host()}/followme/preview`, {method: 'POST', headers: {'Content-Type': 'text/plain'},
+    body: JSON.stringify({wled: S.wledHost, led})}).catch(() => {});
+}
+function preview(led) {
+  clearTimeout(previewTimer);
+  previewOn = true;
+  previewTimer = setTimeout(function again() {
+    postPreview(led);
+    previewTimer = setTimeout(again, 4000);   // the sensor ends a preview 10 s after the last request
+  }, 60);
+}
+function stopPreview() {
+  clearTimeout(previewTimer);
+  if (previewOn) postPreview(0);
+  previewOn = false;
+}
+
+// Everything that must be true before saving; empty when ready.
+function saveProblems() {
+  const out = [];
+  if (!S.wledHost) out.push('Enter the WLED address.');
+  if (!S.ledCount) out.push('Enter the LED count (or tap Read).');
+  for (const [k, f] of Object.entries(FEAT)) if (f.required && S.pins[k] == null) out.push(`Pin the LED at the ${f.tag.toLowerCase()}.`);
+  if (S.ledCount) for (const [k, led] of Object.entries(S.pins)) if (led > S.ledCount) out.push(`The ${FEAT[k].tag.toLowerCase()} pin (LED ${led}) is past the end of the strip.`);
+  const a = S.cl ? anchors(rpOf()) : [];
+  for (let i = 2; i < a.length; i++)
+    if (Math.sign(a[i].led - a[i - 1].led) !== Math.sign(a[1].led - a[0].led)) { out.push('The pinned LEDs are out of order along the stairs. Check each one.'); break; }
+  if (new Set(a.map(q => q.led)).size !== a.length) out.push('Two marks are pinned to the same LED.');
+  return out;
+}
+async function saveToSensor() {
+  const problems = saveProblems();
+  if (problems.length) { toast(problems[0]); return; }
+  if (simOn()) { toast('Simulated: nothing saved'); go(SC.test); return; }
+  if (!devLive()) { toast('Not connected to the sensor'); return; }
+  if (canSave === false) { toast("This sensor's firmware can't store a setup. Update it first."); return; }
+  const rp = rpOf(), fd = k => rp.feats.find(f => f.key === k).d, r1 = v => Math.round(v * 10) / 10;
+  const rev = Date.now();
+  const body = {
+    // back to the sensor's own frame: the LD2450 reports x mirrored
+    cl: S.cl.map(p => [r1(-p.x), r1(p.y)]),
+    bottom: r1(fd('bottom')), top: r1(fd('top')),
+    steps: shape().kind === 'I' ? [S.steps[0]] : [S.steps[0], S.steps[1]],
+    width: Math.round(S.width), wled: S.wledHost,
+    anchors: anchors(rp).map(a => [r1(a.d), a.led]),
+  };
+  if (shape().kind !== 'I') { body.landIn = r1(fd('land-in')); body.landOut = r1(fd('land-out')); }
+  body.wizard = Object.fromEntries(WIZ_KEYS.map(k => [k, k === 'rev' ? rev : S[k]]));
+  if (JSON.stringify(body.wizard).length > WIZ_MAX) { toast('Not saved: the setup is too large for the sensor'); return; }
+  $('next').disabled = true;
+  try {
+    const r = await fetch(`http://${host()}/followme/calibration`, {method: 'POST', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify(body)});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { toast(j.error ? `Not saved: ${j.error}` : 'Not saved: the sensor refused it'); return; }
+    S.rev = rev; S.dirty = false; save(false);
+    toast('Saved to the sensor');
+    go(SC.test);
+  } catch (e) { toast('Not saved: could not reach the sensor'); }
+  finally { render(); }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && Date.now() - lastMsg > 5000) connect();
+});
+connect();
+
+// ---------- simulated walker ----------
+// A person walking the template stairs, seen by a sensor placed in front of
+// them with the whole staircase in view. During a walk they go to each stop
+// and wait there for the tap, like a person; otherwise they walk up and down.
+const SIM_SPEED = 450;    // mm/s
+let simT = 0, simCur = null, simTick = -1, simD = null, simDir = 1, simPause = 0;
+const simOn = () => $('simToggle').checked;
+if (new URLSearchParams(location.search).has('sim')) $('simToggle').checked = true;
+function simFrame(tp) {
+  const pts = [...tp.walls.left, ...tp.walls.right];
+  const cx = (Math.min(...pts.map(p => p.x)) + Math.max(...pts.map(p => p.x))) / 2;
+  const y0 = Math.min(...pts.map(p => p.y)) - 1200;   // sensor 1.2 m before the nearest wall
+  return p => ({x: p.x - cx, y: p.y - y0});
+}
+function simStep(dt) {
+  const tp = tpOf(), fd = k => tp.feats.find(f => f.key === k).d;
+  const lo = fd('floor-lower'), hi = fd('floor-upper');
+  if (simD == null) simD = rec ? START_D : lo;
+  let goal;
+  if (rec) goal = walkStage < 0 ? START_D : walkStops(tp)[walkStage].d;
+  else if (simPause > 0) { simPause -= dt; goal = simD; }
+  else { goal = simDir > 0 ? hi : lo; if (Math.abs(goal - simD) < 1) { simDir = -simDir; simPause = 3; } }
+  simD += clamp(goal - simD, -SIM_SPEED * dt, SIM_SPEED * dt);
+  const i = segAt(tp.cl, tp.m, clamp(simD, 0, tp.m.total));
+  const drift = 110 * Math.sin(simT * .8) + 55 * Math.sin(simT * 2.7 + 1);   // sideways wander, like the LD2450
+  const p = add(pointAt(tp.cl, tp.m, simD), mul(rnorm(unit(tp.cl[i - 1], tp.cl[i])), drift));
+  return simFrame(tp)(p);
+}
+function simUpdate(dt) {
+  const p = simStep(dt);
+  const k = Math.floor(simT * SAMPLE_HZ);
+  if (k === simTick) return;
+  simTick = k;
+  simCur = {x: p.x + (Math.random() - .5) * 60, y: p.y + (Math.random() - .5) * 60};
+  newSample = true;
+}
+const targets = () => simOn() ? (simCur ? [simCur] : []) : live.filter(Boolean);
+
+// ---------- geometry ----------
+function pathMetrics(pts) {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + len(sub(pts[i], pts[i - 1])));
+  return {cum, total: cum[cum.length - 1] || 0};
+}
+function segAt(pts, m, d) { let i = 1; while (i < pts.length - 1 && d > m.cum[i]) i++; return i; }
+function pointAt(pts, m, d) {
+  const i = segAt(pts, m, d), seg = m.cum[i] - m.cum[i - 1] || 1, t = (d - m.cum[i - 1]) / seg;
+  return add(pts[i - 1], mul(sub(pts[i], pts[i - 1]), t));
+}
+function project(pts, m, p) {
+  let best = {along: 0, off: Infinity};
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], ab = sub(pts[i], a), L2 = dot(ab, ab) || 1;
+    const t = clamp(dot(sub(p, a), ab) / L2, 0, 1), off = len(sub(p, add(a, mul(ab, t))));
+    if (off < best.off) best = {along: m.cum[i - 1] + t * Math.sqrt(L2), off};
+  }
+  return best;
+}
+// Like project(), but extends past both ends and gives the signed sideways
+// offset (positive = right of the walking direction).
+function projectSigned(pts, m, p) {
+  let best = {along: 0, off: Infinity, side: 0};
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], ab = sub(pts[i], a), L2 = dot(ab, ab) || 1;
+    let t = dot(sub(p, a), ab) / L2;
+    t = Math.max(i === 1 ? -Infinity : 0, Math.min(i === pts.length - 1 ? Infinity : 1, t));
+    const foot = add(a, mul(ab, t)), off = len(sub(p, foot));
+    if (off < best.off) best = {along: m.cum[i - 1] + t * Math.sqrt(L2), off, side: dot(sub(p, foot), rnorm(unit(a, pts[i])))};
+  }
+  return best;
+}
+// Distance along one plan -> the matching distance along another, feature to feature.
+function mapAlong(d, from, to) {
+  let i = 1;
+  while (i < from.length - 1 && d > from[i].d) i++;
+  const a = from[i - 1], b = from[i], t = (d - a.d) / ((b.d - a.d) || 1);
+  return to[i - 1].d + t * (to[i].d - to[i - 1].d);
+}
+// A radar point placed on the template drawing at the same distance along the
+// stairs and the same sideways offset (kept inside the walls).
+// keepInside false places the point at its true sideways offset (the sensor).
+function toTemplate(rp, tp, p, keepInside = true) {
+  const pr = projectSigned(rp.cl, rp.m, p), d = mapAlong(pr.along, rp.feats, tp.feats);
+  const i = segAt(tp.cl, tp.m, d), n = rnorm(unit(tp.cl[i - 1], tp.cl[i])), lim = dispWidth() / 2 - 60;
+  const side = pr.side * sideSign();
+  return {pt: add(pointAt(tp.cl, tp.m, d), mul(n, keepInside ? clamp(side, -lim, lim) : side)), off: pr.off};
+}
+// A walk that turns the other way from the stairs as described means the
+// sensor sees the room mirrored (mounted upside down or facing the other way).
+// The stairs are drawn as described; radar points' sideways offsets are
+// mirrored to match.
+function sideSign() {
+  const t = S.cl ? walkTurn(S.cl) : 0, want = shape().turn;
+  return t && want && t !== want ? -1 : 1;
+}
+function offsetPolyline(cl, off) {
+  return cl.map((p, i) => {
+    const np = i > 0 ? rnorm(unit(cl[i - 1], p)) : null, nn = i < cl.length - 1 ? rnorm(unit(p, cl[i + 1])) : null;
+    if (!np || !nn) return add(p, mul(np || nn, off));
+    const b = add(np, nn), bl = len(b);
+    if (bl < 1e-6) return add(p, mul(np, off));
+    const bu = mul(b, 1 / bl);
+    return add(p, mul(bu, off / Math.max(dot(bu, np), .2)));
+  });
+}
+
+// Template centre line in plan space (mm, y = up the first flight).
+// Always drawn turning right from the near end; reversed walks it backwards.
+function templateCL() {
+  const sh = shape(), w = dispWidth(), st = dispSteps();
+  if (sh.kind === 'I') { const cl = [{x: 0, y: 0}, {x: 0, y: st[0] * RUN}]; return S.reversed ? cl.reverse() : cl; }
+  const [n1, n2] = S.reversed ? [st[1], st[0]] : st;
+  const c = {x: 0, y: n1 * RUN + w / 2};
+  let cl;
+  if (sh.kind === 'L') cl = [{x: 0, y: 0}, c, {x: w / 2 + n2 * RUN, y: c.y}];
+  else { const c2 = {x: w + GAP, y: c.y}; cl = [{x: 0, y: 0}, c, c2, {x: c2.x, y: c.y - w / 2 - n2 * RUN}]; }
+  return S.reversed ? cl.reverse() : cl;
+}
+
+// Flights, landing, walls, floors and feature distances from a centre line.
+// o.bottom / o.top: distance of the first and last step along cl (default: its
+// ends). o.landIn / o.landOut: the landing's edges (default: a square landing
+// as deep as the stairs are wide, for the template). o.floorLower /
+// o.floorUpper: floor approach before and after the stairs.
+function buildPlan(cl, o = {}) {
+  const sh = shape(), w = dispWidth(), st = dispSteps(), m = pathMetrics(cl);
+  const dB = o.bottom ?? 0, dT = o.top ?? m.total, fL = o.floorLower ?? FLOOR_DEPTH, fU = o.floorUpper ?? FLOOR_DEPTH;
+  const pB = pointAt(cl, m, dB), pT = pointAt(cl, m, dT);
+  const segs = [];
+  for (let i = 1; i < cl.length; i++) segs.push({u: unit(cl[i - 1], cl[i]), L: len(sub(cl[i], cl[i - 1]))});
+  let flights, landing = null, feats;
+  if (sh.kind === 'I') {
+    flights = [{a: pB, b: pT, u: segs[0].u, n: st[0]}];
+    feats = [['bottom', dB], ['top', dT]];
+  } else {
+    const s1 = segs[0], sl = segs[segs.length - 1], last = cl.length - 1;
+    const dIn = o.landIn ?? s1.L - w / 2, dOut = o.landOut ?? m.total - sl.L + w / 2;
+    flights = [
+      {a: pB, b: pointAt(cl, m, dIn), u: s1.u, n: st[0]},
+      {a: pointAt(cl, m, dOut), b: pT, u: sl.u, n: st[1]},
+    ];
+    const v = rnorm(s1.u);
+    if (sh.kind === 'L') {
+      landing = [[1, 1], [1, -1], [-1, -1], [-1, 1]].map(([i, j]) => add(cl[1], add(mul(s1.u, i * w / 2), mul(v, j * w / 2))));
+    } else {
+      const u2 = segs[1].u, p = sub(cl[1], mul(u2, w / 2)), q = add(cl[2], mul(u2, w / 2));
+      landing = [add(p, mul(s1.u, w / 2)), add(q, mul(s1.u, w / 2)), sub(q, mul(s1.u, w / 2)), sub(p, mul(s1.u, w / 2))];
+    }
+    feats = [['bottom', dB], ['land-in', dIn], ['land-out', dOut], ['top', dT]];
+  }
+  feats = [['floor-lower', dB - fL], ...feats, ['floor-upper', dT + fU]];
+  const floor = (p, u, depth) => {
+    const n = rnorm(u), far = add(p, mul(u, depth));
+    return [sub(p, mul(n, w / 2)), add(p, mul(n, w / 2)), add(far, mul(n, w / 2)), sub(far, mul(n, w / 2))];
+  };
+  return {
+    cl, m, flights, landing,
+    floors: {lower: floor(pB, segs[0].u, -fL), upper: floor(pT, segs[segs.length - 1].u, fU)},
+    feats: feats.map(([key, d]) => ({key, d})),
+    walls: {right: offsetPolyline(cl, w / 2), left: offsetPolyline(cl, -w / 2)},
+  };
+}
+// Where the walk put the stairs' features. Each step tap is where the person
+// stood: the middle of that tread. A flight's tread run is the distance
+// between its first and last tap over the treads between them; the flight
+// starts half a run before its first tap and ends half a run after its last.
+// The landing lies between the lower flight's end and the upper flight's start.
+function radarOpts() {
+  if (!S.cl || !S.marks || !stepsAnswered()) return {};
+  const cl = S.cl, m = pathMetrics(cl), mk = S.marks, at = p => clamp(projectSigned(cl, m, p).along, 0, m.total);
+  const tb = at(mk.bottom), tt = Math.max(at(mk.top), tb);
+  const runOf = (a, b, n) => n > 1 ? Math.max(b - a, 0) / (n - 1) : null;
+  if (shape().kind === 'I' || !mk.lastLower || !mk.firstUpper) {
+    const run = runOf(tb, tt, S.steps[0]) ?? TYPICAL_RUN;
+    const b = clamp(tb - run / 2, 0, m.total), t = clamp(tt + run / 2, b, m.total);
+    return {bottom: b, top: t, floorLower: b, floorUpper: m.total - t};
+  }
+  const tl = clamp(at(mk.lastLower), tb, tt), tu = clamp(at(mk.firstUpper), tl, tt);
+  let runB = runOf(tb, tl, S.steps[0]), runT = runOf(tu, tt, S.steps[1]);
+  runB = runB ?? runT ?? TYPICAL_RUN; runT = runT ?? runB;
+  const b = clamp(tb - runB / 2, 0, m.total), t = clamp(tt + runT / 2, b, m.total);
+  let li = clamp(tl + runB / 2, b, t), lo = clamp(tu - runT / 2, b, t);
+  if (lo < li) li = lo = (li + lo) / 2;
+  return {bottom: b, top: t, landIn: li, landOut: lo, floorLower: b, floorUpper: m.total - t};
+}
+const rpOf = () => S.cl ? buildPlan(S.cl, radarOpts()) : null;
+// The drawing: template stairs with floors as long as the walk measured them.
+function tpOf() {
+  const ro = radarOpts();
+  return buildPlan(templateCL(), ro.bottom == null ? {} : {floorLower: clamp(ro.floorLower, 250, 2500), floorUpper: clamp(ro.floorUpper, 250, 2500)});
+}
+// Point on the strip wall at centre-line distance d, slightly inside the wall.
+function wallPoint(plan, d) {
+  const i = segAt(plan.cl, plan.m, d), n = rnorm(unit(plan.cl[i - 1], plan.cl[i]));
+  return add(pointAt(plan.cl, plan.m, d), mul(n, ((stripSide() || insideSide()) === 'right' ? 1 : -1) * (dispWidth() / 2 - 70)));
+}
+// Where the sensor is on the drawing: the radar's own origin, placed on the
+// template like any radar point, aimed at the middle of the stairs. Known
+// once there is a walk.
+function sensorSpot(rp, tp) {
+  if (!rp) return null;
+  const p = toTemplate(rp, tp, {x: 0, y: 0}, false).pt;
+  const mid = pointAt(tp.cl, tp.m, tp.m.total / 2);
+  return {p, aim: unit(p, mid)};
+}
+
+// ---------- fitting ----------
+// One line (straight) or two lines (L, U) through the time-ordered walk, split
+// where the total squared perpendicular distance is smallest.
+function fitWalk(samples) {
+  const sh = shape(), pts = [];
+  for (const s of samples) if (!pts.length || len(sub(s, pts[pts.length - 1])) >= 40) pts.push(s);
+  const k = sh.kind === 'I' ? 1 : 2, n = pts.length, MIN = 3;
+  if (n < 4 * k) return null;
+  const P = [[0, 0, 0, 0, 0]];
+  for (const p of pts) { const l = P[P.length - 1]; P.push([l[0] + p.x, l[1] + p.y, l[2] + p.x * p.x, l[3] + p.y * p.y, l[4] + p.x * p.y]); }
+  const stats = (i, j) => {
+    const a = P[j + 1], b = P[i], c = j - i + 1, mx = (a[0] - b[0]) / c, my = (a[1] - b[1]) / c;
+    const cxx = (a[2] - b[2]) / c - mx * mx, cyy = (a[3] - b[3]) / c - my * my, cxy = (a[4] - b[4]) / c - mx * my;
+    const lam = (cxx + cyy) / 2 - Math.sqrt(((cxx - cyy) / 2) ** 2 + cxy * cxy);
+    return {c, mx, my, cost: lam * c, th: .5 * Math.atan2(2 * cxy, cxx - cyy)};
+  };
+  let parts = [[0, n - 1]];
+  if (k === 2) {
+    let best = Infinity, bj = -1;
+    for (let j = MIN - 1; j <= n - 1 - MIN; j++) {
+      const c = stats(0, j).cost + stats(j + 1, n - 1).cost;
+      if (c < best) { best = c; bj = j; }
+    }
+    parts = [[0, bj], [bj + 1, n - 1]];
+  }
+  const L = parts.map(([i, j]) => {
+    const s = stats(i, j);
+    let d = {x: Math.cos(s.th), y: Math.sin(s.th)};
+    if (dot(sub(pts[j], pts[i]), d) < 0) d = mul(d, -1);
+    return {p: {x: s.mx, y: s.my}, d, i, j};
+  });
+  const proj = (l, q) => add(l.p, mul(l.d, dot(sub(q, l.p), l.d)));
+  const a = proj(L[0], pts[0]), b = proj(L[L.length - 1], pts[n - 1]);
+  if (k === 1) return [a, b];
+  const [l1, l2] = L;
+  if (sh.kind === 'L') {
+    const cr = l1.d.x * l2.d.y - l1.d.y * l2.d.x;
+    if (Math.abs(cr) < .25) return [a, mul(add(proj(l1, pts[l1.j]), proj(l2, pts[l2.i])), .5), b];
+    const w = sub(l2.p, l1.p), t = (w.x * l2.d.y - w.y * l2.d.x) / cr;
+    return [a, add(l1.p, mul(l1.d, t)), b];
+  }
+  let far = -Infinity;
+  for (let i = l1.i; i <= l1.j; i++) far = Math.max(far, dot(sub(pts[i], l1.p), l1.d));
+  const c1 = add(l1.p, mul(l1.d, far));
+  return [a, c1, proj(l2, c1), b];
+}
+// +1 if the walk turns right going up, -1 if left, 0 for straight.
+function walkTurn(cl) {
+  if (cl.length < 3) return 0;
+  const u1 = unit(cl[0], cl[1]), u2 = unit(cl[cl.length - 2], cl[cl.length - 1]);
+  return u1.x * u2.y - u1.y * u2.x < 0 ? 1 : -1;
+}
+function coverage(plan) {
+  const out = [], name = {'floor-lower': 'The lower floor', bottom: 'The bottom', 'land-in': 'The landing', 'land-out': 'The landing', top: 'The top', 'floor-upper': 'The upper floor'};
+  for (const f of plan.feats) {
+    const p = pointAt(plan.cl, plan.m, f.d), ang = Math.abs(Math.atan2(p.x, p.y)) * 180 / Math.PI, r = len(p);
+    let msg = null;
+    if (ang > 55) msg = `${name[f.key]} is at the edge of the sensor's view (${ang | 0}°). Tracking may drop there.`;
+    else if (r > 6000) msg = `${name[f.key]} is ${fmtLen(r)} away, past the sensor's reliable range (${fmtLen(6000)}).`;
+    if (msg && !out.includes(msg)) out.push(msg);
+  }
+  return out;
+}
+
+// ---------- walk report ----------
+// Grades the walk per stretch (each flight, the landing). Lenient on purpose:
+// a stretch fails only on what would break the light, and every limit is in
+// steps of the measured stairs, not distances, because radar distances are
+// consistent but not tape-accurate.
+const GAP_STEPS = 3;        // radar lost the walker for this many steps or more
+const DRIFT_SHARE = .25;    // share of a stretch's samples outside the stairs
+const RUN_FACTOR = 2;       // a flight's steps this many times shorter or longer than TYPICAL_RUN or the other flight's
+function walkReport() {
+  const rp = rpOf();
+  if (!rp) return null;
+  const F = k => rp.feats.find(f => f.key === k).d, w = dispWidth();
+  const st = shape().kind === 'I'
+    ? [{key: 'flight', name: 'Stairs', d0: F('bottom'), d1: F('top'), steps: S.steps[0]}]
+    : [{key: 'lower', name: 'Lower flight', d0: F('bottom'), d1: F('land-in'), steps: S.steps[0]},
+       {key: 'landing', name: 'Landing', d0: F('land-in'), d1: F('land-out')},
+       {key: 'upper', name: 'Upper flight', d0: F('land-out'), d1: F('top'), steps: S.steps[1]}];
+  const flights = st.filter(s => s.steps);
+  for (const s of flights) s.run = (s.d1 - s.d0) / s.steps;
+  const run = flights.reduce((a, s) => a + s.run, 0) / flights.length;
+  const fail = (s, why) => { if (!s.why) s.why = why; };
+
+  // step spacing: implausible on its own, or far from the other flight's
+  for (const s of flights) {
+    if (s.run * RUN_FACTOR < TYPICAL_RUN) fail(s, 'Steps came out too short. Check where you tapped.');
+    else if (s.run > TYPICAL_RUN * RUN_FACTOR) fail(s, 'Steps came out too long. Check where you tapped.');
+  }
+  if (flights.length === 2 && !flights.some(s => s.why)) {
+    const [a, b] = flights, off = s => Math.abs(Math.log(s.run / TYPICAL_RUN));
+    if (Math.max(a.run, b.run) > RUN_FACTOR * Math.min(a.run, b.run)) fail(off(a) >= off(b) ? a : b, "Steps don't match the other flight. Check where you tapped.");
+  }
+
+  // radar samples: gaps along the stairs, and drift off them
+  const pr = S.trail.map(p => projectSigned(rp.cl, rp.m, p));
+  const hasTrail = pr.length >= 8;
+  if (hasTrail) {
+    const ds = pr.map(p => p.along).sort((a, b) => a - b), lo = F('bottom'), hi = F('top');
+    const edges = [Math.min(ds[0], lo), ...ds.filter(d => d > lo && d < hi), Math.max(ds[ds.length - 1], hi)];
+    for (let i = 1; i < edges.length; i++) {
+      const a = Math.max(edges[i - 1], lo), b = Math.min(edges[i], hi), n = Math.round((b - a) / run);
+      if (n >= GAP_STEPS) for (const s of st) if (Math.min(b, s.d1) - Math.max(a, s.d0) >= Math.min(run, s.d1 - s.d0)) fail(s, `Lost you for about ${n} steps.`);
+    }
+    for (const s of st) {
+      const own = pr.filter(p => p.along >= s.d0 && p.along <= s.d1);
+      if (own.length >= 4 && own.filter(p => p.off > w / 2).length > DRIFT_SHARE * own.length) fail(s, 'Your dots wandered off the stairs.');
+    }
+  }
+  const bad = st.filter(s => s.why);
+  return {plan: rp, stretches: st, run, hasTrail, ok: !bad.length,
+    verdict: bad.length ? `Walk it again: ${bad.map(s => s.name.toLowerCase()).join(', ')}` : 'Good walk'};
+}
+// The walk in the sensor's own frame, for debugging and support: mm, raw x.
+function rawNumbers(r) {
+  const p = q => `${Math.round(q.x)}, ${Math.round(q.y)}`, mm = d => `${Math.round(d)} mm`, rp = r.plan;
+  const out = [`FOLLOW-ME WALK · ${shape().label} · steps ${S.steps.join('+')} · width ${mm(dispWidth())}`,
+    'Radar frame: mm from the sensor, x as the sensor reports it.', '',
+    `Path         ${S.cl.map(p).join('  →  ')}`];
+  for (const [k, v] of Object.entries(S.marks)) out.push(`Tap ${k.padEnd(9)} ${p(v)}`);
+  out.push('');
+  for (const s of r.stretches) out.push(`${s.name.padEnd(13)}${mm(s.d1 - s.d0).padStart(8)}${s.run ? `  · step ${mm(s.run)} (${(s.run / IN).toFixed(1)} in)` : ''}${s.why ? '  · ' + s.why : ''}`);
+  out.push('');
+  rp.flights.forEach((f, i) => {
+    const L = len(sub(f.b, f.a));
+    out.push(`Treads, ${r.stretches.filter(s => s.steps)[i].name.toLowerCase()}:`);
+    for (let j = 0; j < f.n; j++) out.push(`  ${pad2(j + 1)}  ${p(add(f.a, mul(f.u, L * (j + .5) / f.n)))}`);
+  });
+  if (S.trail.length) {
+    const offs = S.trail.map(q => projectSigned(rp.cl, rp.m, q).off).sort((a, b) => a - b), pct = k => mm(offs[Math.min(offs.length - 1, Math.floor(k * offs.length))]);
+    const secs = (S.trail[S.trail.length - 1].t - S.trail[0].t) / 1000;
+    out.push('', `Samples      ${S.trail.length} over ${secs.toFixed(1)} s · off the path: median ${pct(.5)}, 90% ${pct(.9)}`);
+  } else out.push('', 'Samples      none kept (setup loaded from the sensor)');
+  return out.join('\n');
+}
+
+// ---------- LED mapping ----------
+// Pinned LEDs along the stairs. guess adds the strip's ends at the stairs'
+// ends where nothing is pinned, for on-screen hints only; saving uses pins.
+function anchors(plan, guess = false) {
+  const a = [], N = S.ledCount || 1, up = S.stripStart !== 'top';
+  for (const f of plan.feats) if (S.pins[f.key] != null) a.push({d: f.d, led: S.pins[f.key], key: f.key});
+  const fd = key => plan.feats.find(f => f.key === key).d;
+  if (guess && S.pins.bottom == null) a.push({d: fd('bottom'), led: up ? 1 : N, key: 'bottom', auto: true});
+  if (guess && S.pins.top == null) a.push({d: fd('top'), led: up ? N : 1, key: 'top', auto: true});
+  return a.sort((p, q) => p.d - q.d);
+}
+function ledAt(d, a) {
+  let i = 1;
+  while (i < a.length - 1 && d > a[i].d) i++;
+  const p = a[i - 1], q = a[i], span = (q.d - p.d) || 1;
+  return p.led + (q.led - p.led) * (d - p.d) / span;
+}
+
+// ---------- drawing ----------
+const ink = a => `rgba(236,232,223,${a})`;
+const WARM = a => `rgba(255,179,90,${a})`;
+const MONO = (px, wt = 400) => `${wt} ${px}px "IBM Plex Mono", ui-monospace, monospace`;
+function fit(cv) {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {ctx, w: r.width, h: r.height};
+}
+function makeView(pts, w, h, padX, padTop, padBot) {
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const p of pts) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
+  const aw = w - 2 * padX, ah = h - padTop - padBot;
+  const s = Math.min(aw / Math.max(x1 - x0, 1), ah / Math.max(y1 - y0, 1));
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, ox = w / 2, oy = padTop + ah / 2;
+  return {s, X: p => ox + (p.x - cx) * s, Y: p => oy - (p.y - cy) * s};
+}
+function polyline(ctx, V, pts, close) {
+  ctx.beginPath();
+  pts.forEach((p, i) => i ? ctx.lineTo(V.X(p), V.Y(p)) : ctx.moveTo(V.X(p), V.Y(p)));
+  if (close) ctx.closePath();
+}
+function drawSensor(ctx, V, p, aim, solid, wedge = 0) {
+  const X = V.X(p), Y = V.Y(p), ang = Math.atan2(-aim.y, aim.x);
+  ctx.save();
+  if (wedge) {
+    const r = wedge * V.s, g = ctx.createRadialGradient(X, Y, 0, X, Y, r);
+    g.addColorStop(0, ink(.1)); g.addColorStop(1, ink(0));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(X, Y); ctx.arc(X, Y, r, ang - Math.PI / 3, ang + Math.PI / 3); ctx.closePath(); ctx.fill();
+  }
+  ctx.translate(X, Y); ctx.rotate(ang + Math.PI / 2);
+  ctx.fillStyle = solid ? ink(.95) : 'transparent'; ctx.strokeStyle = ink(.95); ctx.lineWidth = 1;
+  ctx.fillRect(-8, -3, 16, 6); ctx.strokeRect(-8, -3, 16, 6);
+  ctx.restore();
+}
+function drawPlan(ctx, V, plan, o = {}) {
+  const w = dispWidth();
+  ctx.save(); ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
+  // floors: hatched patches past each end
+  for (const [key, label] of [['lower', 'LOWER FLOOR'], ['upper', 'UPPER FLOOR']]) {
+    const poly = plan.floors[key], xs = poly.map(V.X), ys = poly.map(V.Y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys), hi = o.hiFloor === key;
+    ctx.save();
+    polyline(ctx, V, poly, true);
+    if (hi) { ctx.fillStyle = WARM(.1); ctx.fill(); }
+    ctx.clip();
+    ctx.strokeStyle = hi ? WARM(.4) : ink(key === 'upper' ? .2 : .13); ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let d = -(y1 - y0); d < x1 - x0; d += 7) { ctx.moveTo(x0 + d, y1); ctx.lineTo(x0 + d + (y1 - y0), y0); }
+    ctx.stroke();
+    ctx.restore();
+    polyline(ctx, V, poly, true); ctx.setLineDash(hi ? [] : [3, 3]); ctx.strokeStyle = hi ? WARM(.95) : ink(.35); ctx.lineWidth = hi ? 1.5 : 1; ctx.stroke(); ctx.setLineDash([]); ctx.lineWidth = 1;
+    const cx = (xs[0] + xs[1] + xs[2] + xs[3]) / 4, cy = (ys[0] + ys[1] + ys[2] + ys[3]) / 4;
+    ctx.font = MONO(9.5, 500); ctx.textAlign = 'center';
+    const tw = ctx.measureText(label).width + 10;
+    ctx.fillStyle = 'rgba(14,14,16,.92)'; ctx.fillRect(cx - tw / 2, cy - 9, tw, 16);
+    ctx.fillStyle = hi ? WARM(1) : ink(key === 'upper' ? .9 : .7); ctx.fillText(label, cx, cy + 3);
+    if (hi && o.hiFloorNote) {
+      ctx.font = MONO(10.5, 600);
+      const nw = ctx.measureText(o.hiFloorNote).width + 12;
+      ctx.fillStyle = WARM(1); ctx.fillRect(cx - nw / 2, cy + 12, nw, 18);
+      ctx.fillStyle = '#1b1006'; ctx.fillText(o.hiFloorNote, cx, cy + 25);
+    }
+  }
+  // landing
+  if (plan.landing) {
+    polyline(ctx, V, plan.landing, true); ctx.fillStyle = ink(.035); ctx.fill();
+    ctx.strokeStyle = ink(.35); ctx.lineWidth = 1; ctx.stroke();
+  }
+  // flights and treads
+  for (const f of plan.flights) {
+    const n = rnorm(f.u), L = len(sub(f.b, f.a));
+    for (let i = 0; i <= f.n; i++) {
+      const c = add(f.a, mul(f.u, L * i / f.n));
+      polyline(ctx, V, [sub(c, mul(n, w / 2)), add(c, mul(n, w / 2))]);
+      ctx.strokeStyle = ink(i === 0 || i === f.n ? .45 : .26); ctx.lineWidth = 1; ctx.stroke();
+    }
+  }
+  // walls
+  for (const side of ['left', 'right']) {
+    polyline(ctx, V, plan.walls[side]);
+    const lit = o.strip && side === stripSide();
+    ctx.strokeStyle = lit ? WARM(.55) : ink(.8); ctx.lineWidth = lit ? 2 : 1.5; ctx.stroke();
+  }
+  // walking line with UP arrow
+  ctx.setLineDash([4, 4]); polyline(ctx, V, plan.cl); ctx.strokeStyle = ink(.32); ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]);
+  const e = plan.cl[plan.cl.length - 1], pe = plan.cl[plan.cl.length - 2], u = unit(pe, e);
+  const ex = V.X(e), ey = V.Y(e), ang = Math.atan2(-(u.y), u.x);
+  ctx.save(); ctx.translate(ex, ey); ctx.rotate(ang);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-8, -4); ctx.lineTo(-8, 4); ctx.closePath(); ctx.fillStyle = ink(.6); ctx.fill();
+  ctx.restore();
+  const s0 = plan.cl[0];
+  ctx.beginPath(); ctx.arc(V.X(s0), V.Y(s0), 3, 0, Math.PI * 2); ctx.fillStyle = ink(.6); ctx.fill();
+  // step counts beside each flight, away from the strip
+  if (o.counts) {
+    const away = stripSide() === 'right' ? -1 : 1;
+    ctx.font = MONO(10.5, 500); ctx.textAlign = 'center';
+    plan.flights.forEach(f => {
+      const mid = mul(add(f.a, f.b), .5), p = add(mid, mul(rnorm(f.u), away * (w / 2 + 230)));
+      ctx.fillStyle = ink(.85); ctx.fillText(pad2(f.n), V.X(p), V.Y(p));
+      ctx.fillStyle = ink(.35); ctx.font = MONO(8.5); ctx.fillText('STEPS', V.X(p), V.Y(p) + 12); ctx.font = MONO(10.5, 500);
+    });
+    // width dimension across the far side of the lower floor
+    const f = plan.flights[0], n = rnorm(f.u), base = sub(f.a, mul(f.u, FLOOR_DEPTH + 160));
+    const a = sub(base, mul(n, w / 2)), b = add(base, mul(n, w / 2));
+    polyline(ctx, V, [a, b]); ctx.strokeStyle = ink(.4); ctx.lineWidth = 1; ctx.stroke();
+    for (const q of [a, b]) { polyline(ctx, V, [sub(q, mul(f.u, 70)), add(q, mul(f.u, 70))]); ctx.stroke(); }
+    const lp = sub(base, mul(f.u, 150));
+    ctx.fillStyle = ink(.6); ctx.font = MONO(10); ctx.fillText(`${Math.round(w / IN)} IN`, V.X(lp), V.Y(lp) + 4);
+  }
+  ctx.restore();
+}
+function drawScale(ctx, V, h, bottomPad) {
+  const mm = imperial() ? 914.4 : 1000, label = imperial() ? '3 FT' : '1 M';
+  const px = mm * V.s, x = 24, y = h - bottomPad - 22;
+  ctx.save(); ctx.strokeStyle = ink(.5); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + px, y); ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4); ctx.moveTo(x + px, y - 4); ctx.lineTo(x + px, y + 4); ctx.stroke();
+  ctx.fillStyle = ink(.45); ctx.font = MONO(9.5); ctx.textAlign = 'left'; ctx.fillText(label, x + px + 8, y + 3.5);
+  ctx.restore();
+}
+function drawTarget(ctx, V, p, main) {
+  const X = V.X(p), Y = V.Y(p), pulse = 1 + Math.sin(performance.now() / 280) * .18;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(X, Y, 13 * pulse, 0, Math.PI * 2); ctx.strokeStyle = ink(main ? .35 : .15); ctx.lineWidth = 1; ctx.stroke();
+  ctx.beginPath(); ctx.arc(X, Y, 4.5, 0, Math.PI * 2); ctx.fillStyle = ink(main ? 1 : .45);
+  ctx.shadowColor = '#fff'; ctx.shadowBlur = main ? 12 : 0; ctx.fill();
+  ctx.restore();
+}
+function drawStrip(lit, marks) {
+  const {ctx, w, h} = fit($('strip')), n = S.ledCount, cw = w / n, by = 6, bh = 10;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = ink(.07); ctx.fillRect(0, by, w, bh);
+  ctx.save(); ctx.shadowColor = WARM(.9); ctx.shadowBlur = 10;
+  for (let i = 1; i <= n; i++) {
+    const v = lit(i); if (v <= .004) continue;
+    ctx.fillStyle = `rgba(255,${200 + 30 * v | 0},${140 + 60 * v | 0},${v})`;
+    ctx.fillRect((i - 1) * cw, by, Math.max(cw - (cw > 3 ? 1 : 0), 1), bh);
+  }
+  ctx.restore();
+  const groups = [];
+  for (const mk of [...marks].sort((a, b) => a.led - b.led)) {
+    const x = (mk.led - .5) * cw, g = groups[groups.length - 1];
+    if (g && x - g.x1 < 30) { g.x1 = x; if (!g.labels.includes(mk.label)) g.labels.push(mk.label); g.auto = g.auto && mk.auto; }
+    else groups.push({x0: x, x1: x, labels: [mk.label], auto: mk.auto});
+  }
+  ctx.font = MONO(9); ctx.textAlign = 'center';
+  for (const g of groups) {
+    ctx.strokeStyle = ctx.fillStyle = g.auto ? ink(.3) : ink(.75); ctx.lineWidth = 1;
+    for (const x of [g.x0, g.x1]) { ctx.beginPath(); ctx.moveTo(x + .5, by + bh + 3); ctx.lineTo(x + .5, by + bh + 10); ctx.stroke(); }
+    const label = g.labels.join(' · '), half = ctx.measureText(label).width / 2 + 2;
+    ctx.fillText(label, clamp((g.x0 + g.x1) / 2, half, w - half), by + bh + 22);
+  }
+  ctx.fillStyle = ink(.3); ctx.textAlign = 'left'; ctx.fillText('LED 1', 0, h - 2); ctx.textAlign = 'right'; ctx.fillText(`LED ${n}`, w, h - 2);
+}
+
+// ---------- screens ----------
+let lastFloors = [];
+let rec = false, lastWalls = null;
+// Walk review: the last report, and the raw numbers drawer (open also shows
+// the raw radar dots on the drawing).
+let lastReport = null, rawOpen = false, rawAlpha = 0;
+function go(i) {
+  i = clamp(i, 0, SCREENS.length - 1);
+  if (i > S.screen && !canLeave(S.screen)) return;
+  if (rec) stopWalk(false);
+  if (SCREENS[i].key !== 'match') stopPreview();
+  S.screen = i; save(false); render();
+}
+// Next stays off until the screen's question is answered.
+function canLeave(i) {
+  const k = SCREENS[i].key;
+  if (k === 'shape') return !!S.shape;
+  if (k === 'steps') return stepsAnswered() && !!S.width;
+  if (k === 'strip') return !!stripSide() && !!S.stripStart;
+  if (k === 'walk') return !!S.cl;
+  if (k === 'match') return !!S.cl && saveProblems().length === 0;
+  return true;
+}
+$('back').onclick = () => go(S.screen - 1);
+$('next').onclick = () => SCREENS[S.screen].key === 'match' ? saveToSensor() : go(S.screen + 1);
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove('show'), 3200);
+}
+
+function opt(attrs, label, sub, sel, extra = '') {
+  return `<button class="opt ${sel ? 'sel' : ''}" ${attrs}>${extra}<span><b>${label}</b>${sub ? `<small>${sub}</small>` : ''}</span><i></i></button>`;
+}
+function numRow(label, id, val, unit = '') {
+  return `<div class="num"><label>${label}</label><div class="ctl"><button data-dec="${id}">−</button><output>${val == null ? '—' : val}${unit ? `<small>${unit}</small>` : ''}</output><button data-inc="${id}">+</button></div></div>`;
+}
+const widthShown = () => S.width == null ? null : imperial() ? Math.round(S.width / IN) : Math.round(S.width / 10);
+
+function render() {
+  const sc = SCREENS[S.screen], sh = shape();
+  $('kicker').innerHTML = `<em>${pad2(S.screen + 1)}</em> / ${pad2(SCREENS.length)} &nbsp;—&nbsp; ${sc.name}`;
+  $('title').textContent = sc.title;
+  $('help').textContent = sc.help;
+  $('count').textContent = `${pad2(S.screen + 1)} / ${pad2(SCREENS.length)}`;
+  $('ticks').innerHTML = SCREENS.map((_, i) => `<i class="${i < S.screen ? 'done' : i === S.screen ? 'on' : ''}"></i>`).join('');
+  $('back').style.visibility = S.screen ? 'visible' : 'hidden';
+  $('next').style.visibility = S.screen === SCREENS.length - 1 ? 'hidden' : 'visible';
+  $('next').disabled = !canLeave(S.screen) || rec;
+  $('next').textContent = sc.key === 'match' ? 'Save to sensor →' : 'Next →';
+  $('stripbox').hidden = !(sc.key === 'match' || sc.key === 'test');
+  const B = $('body');
+
+  if (sc.key === 'shape') {
+    B.innerHTML = `<div class="opts">${Object.entries(SHAPES).map(([k, s]) =>
+      opt(`data-shape="${k}"`, s.label, s.sub, S.shape === k, `<svg viewBox="0 0 24 32"><path d="${s.icon}"/></svg>`)).join('')}</div>
+      ${S.shape && sh.kind !== 'I' ? `<button class="line" id="flip" style="width:100%;margin-top:18px">⇅ &nbsp;Flip upper and lower</button>` : ''}
+      <p class="fine">${S.shape && sh.kind !== 'I' ? 'You can also tap a floor on the drawing. ' : ''}Spiral stairs, stairs with more than one landing and corner steps without a landing aren't supported.</p>
+      ${S.shape ? `<button class="ghost" id="restart" style="padding-left:0">Start over</button>
+        <p class="fine" style="margin-top:0">Clears every answer here. The sensor keeps its current setup until you save a new one.</p>` : ''}`;
+    B.querySelectorAll('[data-shape]').forEach(b => b.onclick = () => {
+      if (S.shape === b.dataset.shape) return;
+      S.shape = b.dataset.shape; S.steps = null; S.stripSide = null; S.cl = null; S.trail = []; S.marks = null; S.pins = {};
+      save(); render();
+    });
+    if ($('flip')) $('flip').onclick = flip;
+    if ($('restart')) $('restart').onclick = startOver;
+  } else if (sc.key === 'steps') {
+    const st = S.steps || [], unitTxt = imperial() ? 'in' : 'cm';
+    const rows = sh.kind === 'I' ? [numRow('Steps', 's0', st[0])]
+      : [numRow('Lower flight', 's0', st[0]), numRow('Upper flight', 's1', st[1])];
+    rows.push(numRow('Stair width', 'w', widthShown(), unitTxt));
+    B.innerHTML = `<div>${rows.join('')}</div>
+      <div class="row" style="margin-top:14px;justify-content:space-between"><span class="fine" style="margin:0">Measure the width wall to wall (or rail to wall).</span>
+        <span class="row" style="gap:4px"><button class="line ${imperial() ? 'on' : ''}" data-units="imperial" style="padding:6px 10px">in</button><button class="line ${imperial() ? '' : 'on'}" data-units="metric" style="padding:6px 10px">cm</button></span></div>
+      ${sh.kind !== 'I' ? `<button class="line" id="flip" style="width:100%;margin-top:18px">⇅ &nbsp;Flip upper and lower</button>` : ''}`;
+    if ($('flip')) $('flip').onclick = flip;
+    const bump = (id, d) => {
+      if (id === 'w') {
+        const cur = widthShown() ?? (imperial() ? 36 : 90);
+        S.width = imperial() ? clamp(cur + (S.width == null ? 0 : d), 12, 98) * IN : clamp(cur + (S.width == null ? 0 : d), 30, 250) * 10;
+      } else {
+        // An unanswered count shows "—"; its first press fills in the drawing's value.
+        const i = +id[1], st = S.steps ? [...S.steps] : dispSteps().map(() => null);
+        st[i] = st[i] == null ? dispSteps()[i] : clamp(st[i] + d, 1, 40);
+        S.steps = st;
+      }
+      save(); render();
+    };
+    B.querySelectorAll('[data-dec]').forEach(b => b.onclick = () => bump(b.dataset.dec, -1));
+    B.querySelectorAll('[data-inc]').forEach(b => b.onclick = () => bump(b.dataset.inc, 1));
+    B.querySelectorAll('[data-units]').forEach(b => b.onclick = () => { S.units = b.dataset.units; save(false); render(); });
+  } else if (sc.key === 'strip') {
+    const turning = sh.kind !== 'I';
+    const sides = turning ? [['inside', 'Inside wall', 'Along the turn'], ['outside', 'Outside wall', 'Around the outside of the turn']]
+      : [['left', 'Left wall', 'Going up'], ['right', 'Right wall', 'Going up']];
+    B.innerHTML = `<div class="group">WALL</div><div class="opts">
+        ${sides.map(([k, l, sub]) => opt(`data-side="${k}"`, l, sub, S.stripSide === k)).join('')}
+      </div><div class="group">LED 1 IS AT</div><div class="opts">
+        ${opt('data-start="bottom"', 'The bottom', 'The data wire comes in downstairs', S.stripStart === 'bottom')}
+        ${opt('data-start="top"', 'The top', 'The data wire comes in upstairs', S.stripStart === 'top')}
+      </div>
+      <p class="fine">Not sure which end is LED 1? Pick either; the next screens line it up with the real strip.</p>`;
+    B.querySelectorAll('[data-side]').forEach(b => b.onclick = () => { S.stripSide = b.dataset.side; save(); render(); });
+    B.querySelectorAll('[data-start]').forEach(b => b.onclick = () => { S.stripStart = b.dataset.start; save(); render(); });
+  } else if (sc.key === 'walk') {
+    if (rec) {
+      const st = walkStops(tpOf())[walkStage];
+      $('help').textContent = st.help;
+      B.innerHTML = `<button class="go wide rec" id="walkTap">${st.button}</button>
+        <p class="fine mono" id="recCount"></p>
+        <button class="ghost" id="walkCancel" style="padding-left:0">Cancel</button>`;
+      $('walkTap').onclick = walkTap;
+      $('walkCancel').onclick = () => stopWalk(false);
+    } else if (!S.cl) {
+      $('help').textContent = "Stand on the lower floor, shown in orange, a couple of steps back from the stairs. Tap Start when you're there.";
+      B.innerHTML = `<button class="go wide" id="walkTap">Start</button>
+        <p class="fine">You'll walk up once, stopping on a few steps along the way. Walk at your normal pace between stops.</p>`;
+      $('walkTap').onclick = startWalk;
+    } else {
+      const r = lastReport = walkReport(), warns = coverage(r.plan);
+      $('help').textContent = '';
+      B.innerHTML = `<div class="verdict${r.ok ? '' : ' bad'}">${esc(r.verdict)}</div>
+        <div class="stretches">${r.stretches.map(s => `<div class="stretch${s.why ? ' bad' : ''}">
+          <i>${s.why ? '!' : '✓'}</i><b>${esc(s.name)}</b><span class="val">${s.steps ? `${s.steps} step${s.steps > 1 ? 's' : ''}` : ''}</span>
+          ${s.why ? `<small>${esc(s.why)}</small>` : ''}</div>`).join('')}</div>
+        ${r.hasTrail ? '' : '<p class="fine">This setup came from the sensor, which keeps only the result of the walk, so only the step spacing was checked.</p>'}
+        ${warns.map(w => `<div class="warn">${esc(w)}</div>`).join('')}
+        <div class="row" style="margin-top:18px"><button class="line" id="redo">Walk again</button></div>
+        <details class="raw" id="raw"${rawOpen ? ' open' : ''}><summary>Show raw numbers</summary>
+          <pre id="rawText">${esc(rawNumbers(r))}</pre>
+          <button class="line" id="rawCopy" style="padding:8px 14px">Copy</button></details>`;
+      $('redo').onclick = startWalk;
+      $('raw').ontoggle = () => { rawOpen = $('raw').open; };
+      $('rawCopy').onclick = copyRaw;
+    }
+  } else if (sc.key === 'match') {
+    const plan = rpOf(), a = anchors(plan, true), pf = pinFeats(plan), n = S.ledCount;
+    if (!pf.some(f => f.key === S.feat)) S.feat = 'bottom';
+    const problems = saveProblems();
+    B.innerHTML = `<div class="row" style="gap:16px;align-items:flex-end">
+        <label class="field" style="flex:1">WLED ADDRESS<input class="input" id="wledHost" placeholder="192.168.1.50" value="${esc(S.wledHost)}" autocomplete="off" spellcheck="false"></label>
+        <label class="field" style="width:70px">LEDS<input class="input" id="ledCount" type="number" min="1" max="1500" value="${n ?? ''}"></label>
+        <button class="line" id="wledRead" style="padding:8px 12px">Read</button></div>
+      <div class="fine mono" id="wledMsg" style="margin:8px 0 0">${wledNote}</div>
+      ${n ? `<div class="opts" style="margin-top:18px">${pf.map(f => {
+        const pin = S.pins[f.key], guess = clamp(Math.round(ledAt(f.d, a)), 1, n);
+        return opt(`data-feat="${f.key}"`, FEAT[f.key].label, FEAT[f.key].required ? '' : 'Optional: pin it if the strip has a gap or a joint here', S.feat === f.key)
+          .replace('<i></i>', `<span class="val">${pin != null ? 'LED ' + pin : 'guess ' + guess}</span><i></i>`);
+      }).join('')}</div>
+      <div class="ledpick"><button data-n="-10">−10</button><button data-n="-1">−1</button>
+        <div class="big" id="ledBig"></div><button data-n="1">+1</button><button data-n="10">+10</button></div>
+      <input type="range" id="ledSlider" min="1" max="${n}">
+      <div class="row" style="margin-top:12px"><button class="go" id="pin" style="flex:1">Pin here</button><button class="line" id="unpin">Unpin</button></div>
+      <p class="fine">${devLive() && S.wledHost ? 'The chosen LED lights up amber on your strip.' : 'Connect to the sensor and enter the WLED address to light the chosen LED on your strip.'}</p>
+      ${problems.length && Object.keys(S.pins).length ? `<div class="warn">${esc(problems[0])}</div>` : ''}` : ''}`;
+    if (n) {
+      syncCursor(plan, a);
+      B.querySelectorAll('[data-feat]').forEach(b => b.onclick = () => { S.feat = b.dataset.feat; S.cursor = null; save(); render(); });
+      B.querySelectorAll('[data-n]').forEach(b => b.onclick = () => setCursor(S.cursor + +b.dataset.n));
+      $('ledSlider').oninput = e => setCursor(+e.target.value);
+      $('pin').onclick = () => {
+        S.pins[S.feat] = S.cursor;
+        const i = pf.findIndex(f => f.key === S.feat);
+        const next = pf.slice(i + 1).find(f => S.pins[f.key] == null) || pf.find(f => S.pins[f.key] == null);
+        if (next) { S.feat = next.key; S.cursor = null; }
+        save(); render();
+      };
+      $('unpin').disabled = S.pins[S.feat] == null;
+      $('unpin').onclick = () => { delete S.pins[S.feat]; S.cursor = null; save(); render(); };
+    }
+    $('ledCount').onchange = e => { setLedCount(Math.round(+e.target.value) || null); render(); };
+    $('wledHost').onchange = e => { const h = cleanHost(e.target.value); if (h !== S.wledHost) { S.wledHost = h; save(); readWled(); } };
+    $('wledRead').onclick = readWled;
+    if ($('wledFix')) $('wledFix').onclick = fixWled;
+  } else if (sc.key === 'test') {
+    const steps = v => `${v} step${v === 1 ? '' : 's'}`;
+    const T = [['window', 'Window', 1, 15, .5, steps], ['buffer', 'Buffer', 0, 5, .25, steps],
+      ['smooth', 'Smoothness', 0, 100, 5, v => `${v}%`], ['hold', 'Hold', 0, 60, 1, v => `${v} s`],
+      ['approach', 'Approach', 0, 6, .5, steps],
+      ['offset', 'Offset', -3, 3, .25, v => v === 0 ? 'none' : `${steps(Math.abs(v))} ${v > 0 ? 'ahead' : 'behind'}`]];
+    const defaults = {window: 3, buffer: 1, smooth: 50, hold: 4, approach: 2, offset: 0};
+    B.innerHTML = T.map(([k, l, mn, mx, st, f]) => {
+      const r = knobRange[k] || {min: mn, max: mx, step: st}, v = S.tune[k] ?? defaults[k];
+      return `<div class="tune"><div class="t"><span>${l}</span><b id="v_${k}">${f(v)}</b></div>
+      <input type="range" data-tune="${k}" min="${r.min}" max="${r.max}" step="${r.step}" value="${v}"></div>`;
+    }).join('') +
+      `<p class="fine">${devLive() ? "These are the sensor's own settings. Changes apply to the light right away. Approach is how far from the stairs the light comes on. Offset puts the light that many steps ahead of you in the direction you walk, so + means higher going up and lower going down (− puts it behind you)." : 'Not connected: the sliders only change the drawing.'}</p>`;
+    B.querySelectorAll('[data-tune]').forEach(r => {
+      const k = r.dataset.tune, f = T.find(t => t[0] === k)[5];
+      r.addEventListener('show', () => { $('v_' + k).textContent = f(+r.value); });
+      r.oninput = e => { S.tune[k] = +e.target.value; $('v_' + k).textContent = f(S.tune[k]); save(false); setKnob(k, S.tune[k]); };
+    });
+  }
+}
+function syncCursor(plan, a) {
+  if (S.cursor == null) {
+    const f = plan.feats.find(f => f.key === S.feat);
+    S.cursor = S.pins[S.feat] != null ? S.pins[S.feat] : Math.round(ledAt(f.d, a));
+  }
+  setCursor(S.cursor);
+}
+function setCursor(v) {
+  S.cursor = clamp(Math.round(v), 1, S.ledCount || 1); save(false);
+  $('ledBig').innerHTML = `${S.cursor}<small>LED</small>`;
+  $('ledSlider').value = S.cursor;
+  if (SCREENS[S.screen].key === 'match') preview(S.cursor);
+}
+// A new LED count drops pins past the strip's end.
+function setLedCount(n) {
+  S.ledCount = n ? clamp(n, 1, 1500) : null;
+  for (const k of Object.keys(S.pins)) if (!S.ledCount || S.pins[k] > S.ledCount) delete S.pins[k];
+  S.cursor = null; save();
+}
+
+// ---------- WLED ----------
+// Read reads the LED count and strip type, then checks the realtime settings
+// follow-me relies on. Fix writes them.
+let wledNote = '', wledFixes = null;
+const WLED_CHECKS = [
+  {test: c => c.if.live.en === true, fix: {if: {live: {en: true}}}, msg: 'Realtime input is off ("Receive UDP realtime").'},
+  {test: c => c.if.live.mso === false, fix: {if: {live: {mso: false}}}, msg: '"Use main segment only" is on, which shifts the LED numbers.'},
+  {test: c => (c.if.live.offset ?? 0) === 0, fix: {if: {live: {offset: 0}}}, msg: 'A realtime LED offset is set, which shifts the LED numbers.'},
+  {test: c => c.if.live.maxbri === true, fix: {if: {live: {maxbri: true}}}, msg: '"Force max brightness" is off, so WLED\'s brightness dims follow-me twice.'},
+  {test: c => c.if.live['no-gc'] === true, fix: {if: {live: {'no-gc': true}}}, msg: 'Realtime gamma correction is on; follow-me applies its own.'},
+  {test: c => !pauseWhenOn || c.def.on === false, fix: {def: {on: false}}, msg: 'WLED turns on at power-up, which pauses follow-me until it is turned off.'},
+];
+const merge = (a, b) => { for (const k of Object.keys(b)) a[k] = b[k] && typeof b[k] === 'object' ? merge(a[k] || {}, b[k]) : b[k]; return a; };
+async function wledFetch(path, opts = {}) {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 4000);
+  try { return await (await fetch(`http://${S.wledHost}${path}`, Object.assign({signal: ctl.signal}, opts))).json(); }
+  finally { clearTimeout(t); }
+}
+const wledErr = e => `Could not reach WLED at ${esc(S.wledHost)} (${e.name === 'AbortError' ? 'no answer in 4 s' : esc(e.message)}). Type the LED count instead.`;
+async function readWled() {
+  const h = cleanHost($('wledHost') ? $('wledHost').value : S.wledHost);
+  if (!h) { wledNote = 'Enter the WLED address first.'; render(); return; }
+  S.wledHost = h; save(); wledNote = 'Reading…'; wledFixes = null; render();
+  try {
+    const j = await wledFetch('/json/info');
+    setLedCount(j.leds.count); S.ledWhite = !!(j.leds.lc & 2); save();
+    let note = `${esc(j.name || 'WLED')}: ${j.leds.count} ${S.ledWhite ? 'RGBW' : 'RGB'} LEDs.`;
+    const cfg = await wledFetch('/json/cfg');
+    const bad = WLED_CHECKS.filter(c => { try { return !c.test(cfg); } catch (e) { return true; } });
+    if (bad.length) {
+      wledFixes = bad.reduce((acc, c) => merge(acc, c.fix), {});
+      note += `<div class="warn">${bad.map(c => esc(c.msg)).join('<br>')}<br><button class="line" id="wledFix" style="margin-top:8px;padding:6px 12px">Fix WLED settings</button></div>`;
+    }
+    wledNote = note;
+  } catch (e) { wledNote = wledErr(e); }
+  render();
+  if (S.cursor) preview(S.cursor);
+}
+async function fixWled() {
+  if (!wledFixes) return;
+  try {
+    await wledFetch('/json/cfg', {method: 'POST', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify(wledFixes)});
+    toast('WLED settings fixed');
+  } catch (e) { toast('Could not change the WLED settings'); }
+  readWled();
+}
+
+// The walk, one tap per stop. Each stop's d is its spot on the template drawing.
+// Step stops are tread middles: the middle of the first and last tread of each flight.
+function walkStops(tp) {
+  const sh = shape(), f0 = tp.flights[0], fl = tp.flights[tp.flights.length - 1];
+  const run = f => len(sub(f.b, f.a)) / f.n;
+  const stops = [{key: 'first', d: tp.m.total && f0.a ? fdOf(tp, 'bottom') + run(f0) / 2 : 0, label: 'FIRST STEP',
+    button: "I'm on the first step", help: 'Walk to the first step. Stand on it, then tap.'}];
+  if (sh.kind !== 'I') {
+    stops.push({key: 'lastLower', d: fdOf(tp, 'land-in') - run(f0) / 2, label: 'LAST STEP BEFORE THE LANDING',
+      button: "I'm on the last step before the landing", help: 'Walk up to the last step before the landing. Stand on it, then tap.'});
+    stops.push({key: 'firstUpper', d: fdOf(tp, 'land-out') + run(fl) / 2, label: 'FIRST STEP AFTER THE LANDING',
+      button: "I'm on the first step after the landing", help: 'Cross the landing to the first step of the upper flight. Stand on it, then tap.'});
+  }
+  stops.push({key: 'last', d: fdOf(tp, 'top') - run(fl) / 2, label: 'LAST STEP',
+    button: "I'm on the last step", help: 'Walk up to the last step. Stand on it, then tap.'});
+  stops.push({key: 'done', d: fdOf(tp, 'top') + FLOOR_STOP, label: 'UPPER FLOOR', floor: 'upper',
+    button: 'Done', help: 'Walk a couple of steps onto the upper floor (orange), stop, then tap Done.'});
+  return stops;
+}
+const fdOf = (plan, key) => plan.feats.find(f => f.key === key).d;
+const START_D = -FLOOR_DEPTH * .6;   // template spot assumed for the start tap
+const LIVE_DEADBAND = 350;           // mm off the last tap before the live dot moves: about twice the LD2450's position wobble
+
+// Live tracking during the walk: each tap is an anchor (radar point + template
+// spot). Past the deadband, a line through the samples since the anchor gives
+// the direction; distance along it moves the dot, up to the next stop.
+let walkStage = -1, walkTaps = {}, walkAnchors = [], liveDots = [], liveShown = null;
+function principalDir(pts, hint) {
+  const n = pts.length, mx = pts.reduce((a, p) => a + p.x, 0) / n, my = pts.reduce((a, p) => a + p.y, 0) / n;
+  let cxx = 0, cyy = 0, cxy = 0;
+  for (const p of pts) { cxx += (p.x - mx) ** 2; cyy += (p.y - my) ** 2; cxy += (p.x - mx) * (p.y - my); }
+  const th = .5 * Math.atan2(2 * cxy, cxx - cyy), d = {x: Math.cos(th), y: Math.sin(th)};
+  return dot(d, hint) < 0 ? mul(d, -1) : d;
+}
+function liveAlong(next) {
+  const A = walkAnchors[walkAnchors.length - 1];
+  if (!A || !A.p) return A ? A.d : START_D;
+  const pts = S.trail.filter(q => q.t >= A.t), cur = pts[pts.length - 1];
+  if (!cur || len(sub(cur, A.p)) < LIVE_DEADBAND) return A.d;
+  const dir = principalDir([A.p, ...pts], sub(cur, A.p));
+  return clamp(A.d + dot(sub(cur, A.p), dir), A.d, next);
+}
+// Plain-http pages (the sensor's own) have no clipboard API: select the text instead.
+function copyRaw() {
+  const text = $('rawText').textContent;
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => toast('Copied'), () => selectRaw());
+  } else selectRaw();
+}
+function selectRaw() {
+  const sel = getSelection(), range = document.createRange();
+  range.selectNodeContents($('rawText')); sel.removeAllRanges(); sel.addRange(range);
+  toast('Selected. Copy it from here.');
+}
+function startWalk() {
+  const now = Date.now();
+  rec = true; walkStage = 0; walkTaps = {start: now};
+  walkAnchors = [{p: null, d: START_D, t: now}]; liveDots = []; liveShown = null;
+  S.trail = []; S.cl = null; S.marks = null; S.pins = {};
+  simD = START_D; simTick = -1;
+  save(); render();
+}
+function walkTap() {
+  const st = walkStops(tpOf())[walkStage], now = Date.now();
+  if (st.key === 'done') return stopWalk(true);
+  walkTaps[st.key] = now;
+  walkAnchors.push({p: S.trail.length ? S.trail[S.trail.length - 1] : null, d: st.d, t: now});
+  walkStage++; render();
+}
+// Position at time t, interpolated between the radar samples around it.
+function trailAt(t) {
+  const tr = S.trail, i = tr.findIndex(q => q.t >= t);
+  if (i < 0) return tr[tr.length - 1];
+  if (i === 0) return tr[0];
+  const a = tr[i - 1], b = tr[i], k = (t - a.t) / ((b.t - a.t) || 1);
+  return {x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k};
+}
+function stopWalk(doFit) {
+  rec = false; walkStage = -1;
+  if (doFit) {
+    const cl = fitWalk(S.trail);
+    if (!cl) toast('Not enough of a walk to go on. Try again, a bit slower.');
+    else {
+      S.cl = cl;
+      S.marks = {bottom: trailAt(walkTaps.first), top: trailAt(walkTaps.last)};
+      if (walkTaps.lastLower) { S.marks.lastLower = trailAt(walkTaps.lastLower); S.marks.firstUpper = trailAt(walkTaps.firstUpper); }
+      const ro = radarOpts();
+      if (ro.top - ro.bottom < 300) { S.cl = null; S.marks = null; toast('The first and last step came out on top of each other. Try again.'); }
+      else toast('Got it');
+    }
+  }
+  save(); render();
+}
+
+// ---------- pointer: floors, sensor spots, strip wall ----------
+const cv = $('cv');
+function local(e) { const r = cv.getBoundingClientRect(); return {X: e.clientX - r.left, Y: e.clientY - r.top}; }
+function inPoly(P, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const a = pts[i], b = pts[j];
+    if ((a.y > P.y) !== (b.y > P.y) && P.x < (b.x - a.x) * (P.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+function distToPoly(P, pts) {
+  let best = Infinity;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], ab = sub(pts[i], a), L2 = dot(ab, ab) || 1, t = clamp(dot(sub(P, a), ab) / L2, 0, 1);
+    best = Math.min(best, len(sub(P, add(a, mul(ab, t)))));
+  }
+  return best;
+}
+cv.addEventListener('pointerdown', e => {
+  const {X, Y} = local(e), P = {x: X, y: Y}, k = SCREENS[S.screen].key;
+  if ((k === 'shape' || k === 'steps') && S.shape && shape().kind !== 'I' && lastFloors.some(f => inPoly(P, f))) { flip(); return; }
+  if (k === 'strip' && lastWalls) {
+    const dl = distToPoly(P, lastWalls.left), dr = distToPoly(P, lastWalls.right);
+    if (Math.min(dl, dr) >= 40) return;
+    const lr = dl < dr ? 'left' : 'right';
+    S.stripSide = shape().kind === 'I' ? lr : lr === insideSide() ? 'inside' : 'outside';
+    save(); render();
+  }
+});
+// ---------- glow (test screen) ----------
+const glow = {pos: null, center: null, shown: null, alpha: 0, lastSeen: -1e9};
+function tickGlow(dt, now, plan, ts) {
+  let best = null;
+  for (const t of ts) { const p = project(plan.cl, plan.m, t); if (p.off < 0.8 * dispWidth() && (!best || p.off < best.off)) best = p; }
+  // one step = the mean tread run, as the sensor counts it
+  const run = plan.flights.reduce((a, f) => a + len(sub(f.b, f.a)), 0) / plan.flights.reduce((a, f) => a + f.n, 0);
+  const tune = Object.assign({window: 3, buffer: 1, smooth: 50, hold: 4}, S.tune);
+  const half = tune.window * run / 2, margin = Math.max(0, half - tune.buffer * run);
+  if (best) {
+    const k = 1 - Math.exp(-dt * (1 + (100 - tune.smooth) / 100 * 14));
+    glow.pos = glow.pos == null ? best.along : glow.pos + (best.along - glow.pos) * k;
+    if (glow.center == null || glow.alpha < .01) glow.center = glow.shown = glow.pos;
+    if (glow.pos > glow.center + margin) glow.center = glow.pos - margin;
+    if (glow.pos < glow.center - margin) glow.center = glow.pos + margin;
+    glow.lastSeen = now; glow.alpha = Math.min(1, glow.alpha + dt);
+  } else if (now - glow.lastSeen > tune.hold * 1000) {
+    glow.alpha = Math.max(0, glow.alpha - dt / 1.5);
+    if (glow.alpha === 0) glow.pos = null;
+  }
+  if (glow.center != null) glow.shown += (glow.center - glow.shown) * (1 - Math.exp(-dt * 6));
+  return {center: glow.shown, half, alpha: glow.alpha * glow.alpha * (3 - 2 * glow.alpha)};
+}
+
+// ---------- frame ----------
+const disp = {};
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(.1, (now - last) / 1000); last = now;
+  simT += dt;
+  if (simOn()) simUpdate(dt);
+
+  // status
+  stamps = stamps.filter(t => Date.now() - t < 5000);
+  const L = $('live');
+  if (simOn()) { L.className = 'live sim'; $('liveTxt').textContent = 'SIMULATED'; }
+  else if (Date.now() - lastMsg < 20000) { L.className = 'live on'; $('liveTxt').textContent = `LIVE · ${(stamps.length / 5).toFixed(1)}/S`; }
+  else { L.className = 'live off'; $('liveTxt').textContent = 'OFFLINE'; }
+
+  const k = SCREENS[S.screen].key, ts = targets();
+  const {ctx, w, h} = fit(cv);
+  ctx.clearRect(0, 0, w, h);
+  const stripOn = k === 'match' || k === 'test', padBot = stripOn ? 96 : 48;
+  let readout = '';
+
+  if (k === 'shape' && !S.shape) {
+    readout = 'PICK A SHAPE';
+  } else if (k === 'shape' || k === 'steps' || k === 'strip') {
+    const plan = tpOf();
+    const pts = [...plan.walls.left, ...plan.walls.right, ...plan.floors.lower, ...plan.floors.upper];
+    if (k === 'steps') pts.push(sub(plan.cl[0], mul(plan.flights[0].u, FLOOR_DEPTH + 320)));
+    const V = makeView(pts, w, h, 48, 56, padBot);
+    drawPlan(ctx, V, plan, {counts: k === 'steps', strip: k === 'strip'});
+    lastFloors = [plan.floors.lower, plan.floors.upper].map(f => f.map(p => ({x: V.X(p), y: V.Y(p)})));
+    if (k === 'strip') lastWalls = {left: plan.walls.left.map(p => ({x: V.X(p), y: V.Y(p)})), right: plan.walls.right.map(p => ({x: V.X(p), y: V.Y(p)}))};
+    drawScale(ctx, V, h, 0);
+    readout = k === 'strip' ? 'PLAN · TAP A WALL' : 'PLAN';
+  } else {
+    // Walk, match and test: everything is placed on the template drawing.
+    const tp = tpOf(), rp = rpOf();
+    const sensor = sensorSpot(rp, tp);
+    const V = makeView([...tp.walls.left, ...tp.walls.right, ...tp.floors.lower, ...tp.floors.upper, ...(sensor ? [sensor.p] : [])], w, h, 48, 56, padBot);
+    const stops = k === 'walk' && rec ? walkStops(tp) : null;
+    const hiFloor = k === 'walk' && !rec && !S.cl ? 'lower' : stops && stops[walkStage].floor || null;
+    drawPlan(ctx, V, tp, {strip: k !== 'walk', hiFloor, hiFloorNote: hiFloor === 'lower' ? 'STAND HERE' : null});
+    if (sensor) drawSensor(ctx, V, sensor.p, sensor.aim, true);
+
+    // the next stop: a big dot to stand on, then tap
+    if (stops) {
+      const st = stops[walkStage], p = pointAt(tp.cl, tp.m, st.d), X = V.X(p), Y = V.Y(p), pulse = (performance.now() % 1600) / 1600;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(X, Y, 12 + pulse * 30, 0, Math.PI * 2); ctx.strokeStyle = WARM(.85 * (1 - pulse)); ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(X, Y, 11, 0, Math.PI * 2); ctx.fillStyle = WARM(1); ctx.shadowColor = WARM(1); ctx.shadowBlur = 18; ctx.fill();
+      ctx.shadowBlur = 0; ctx.textAlign = 'center';
+      ctx.font = MONO(10.5, 600);
+      const t1 = st.label, w1 = ctx.measureText(t1).width + 12;
+      ctx.fillStyle = WARM(1); ctx.fillRect(X - w1 / 2, Y + 20, w1, 18);
+      ctx.fillStyle = '#1b1006'; ctx.fillText(t1, X, Y + 33);
+      ctx.font = MONO(9, 500);
+      const t2 = 'STAND HERE, THEN TAP', w2 = ctx.measureText(t2).width + 10;
+      ctx.fillStyle = 'rgba(14,14,16,.92)'; ctx.fillRect(X - w2 / 2, Y + 39, w2, 15);
+      ctx.fillStyle = WARM(.9); ctx.fillText(t2, X, Y + 50);
+      ctx.restore();
+
+      // you, live: painted trail and the dot
+      const target = liveAlong(st.d);
+      liveShown = liveShown == null ? target : liveShown + (target - liveShown) * (1 - Math.exp(-dt * 4));
+      ctx.save(); ctx.fillStyle = WARM(.45);
+      for (const d of liveDots) { const q = pointAt(tp.cl, tp.m, d); ctx.beginPath(); ctx.arc(V.X(q), V.Y(q), 2.2, 0, Math.PI * 2); ctx.fill(); }
+      ctx.restore();
+      if (walkAnchors.length && walkAnchors[walkAnchors.length - 1].p) drawTarget(ctx, V, pointAt(tp.cl, tp.m, liveShown), true);
+    }
+
+    // pick the target to follow / record
+    const lastS = S.trail[S.trail.length - 1];
+    let used = -1, bd = Infinity;
+    ts.forEach((t, i) => {
+      const d = rec && lastS ? len(sub(t, lastS)) : rp ? project(rp.cl, rp.m, t).off : len(t);
+      if (d < bd) { bd = d; used = i; }
+    });
+    if (newSample) {
+      newSample = false;
+      if (rec && used >= 0) {
+        const q = {x: Math.round(ts[used].x), y: Math.round(ts[used].y), t: Date.now()};
+        S.trail.push(q);
+        for (const A of walkAnchors) if (!A.p) A.p = q;          // a tap made before any sample arrived
+        if (stops) liveDots.push(liveAlong(stops[walkStage].d));
+        const rc = $('recCount'); if (rc) rc.textContent = `${S.trail.length} SAMPLES`;
+      }
+    }
+    const onStairs = p => rp && toTemplate(rp, tp, p).off < 0.8 * dispWidth();
+
+    if (k === 'walk' && rp && !rec) {
+      // stretches that failed the report, tinted on the drawing
+      const bad = new Set((lastReport ? lastReport.stretches : []).filter(s => s.why).map(s => s.key)), wd = dispWidth();
+      const flightPoly = f => { const n = mul(rnorm(f.u), wd / 2); return [sub(f.a, n), add(f.a, n), add(f.b, n), sub(f.b, n)]; };
+      const polys = {flight: tp.flights[0], lower: tp.flights[0], upper: tp.flights[1]};
+      ctx.save();
+      for (const key of bad) {
+        const poly = key === 'landing' ? tp.landing : polys[key] && flightPoly(polys[key]);
+        if (!poly) continue;
+        polyline(ctx, V, poly, true); ctx.fillStyle = WARM(.16); ctx.fill();
+        ctx.strokeStyle = WARM(.8); ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      // raw radar dots, only while the raw numbers are open
+      rawAlpha += ((rawOpen ? 1 : 0) - rawAlpha) * (1 - Math.exp(-dt * 8));
+      if (rawAlpha > .01) {
+        ctx.fillStyle = WARM(.7 * rawAlpha);
+        for (const p of S.trail) { const q = toTemplate(rp, tp, p).pt; ctx.beginPath(); ctx.arc(V.X(q), V.Y(q), 2.2, 0, Math.PI * 2); ctx.fill(); }
+      }
+      ctx.restore();
+    }
+    if (k === 'match' && rp) {
+      const a = anchors(rp, true), f = tp.feats.find(f => f.key === S.feat) || pinFeats(tp)[0], p = wallPoint(tp, f.d);
+      const X = V.X(p), Y = V.Y(p);
+      ctx.save(); ctx.translate(X, Y); ctx.rotate(Math.PI / 4);
+      ctx.shadowColor = WARM(1); ctx.shadowBlur = 14; ctx.fillStyle = WARM(1); ctx.fillRect(-5, -5, 10, 10); ctx.restore();
+      ctx.save(); ctx.fillStyle = ink(.85); ctx.font = MONO(9.5, 500); ctx.textAlign = 'left'; ctx.fillText(FEAT[f.key].tag, X + 12, Y - 10); ctx.restore();
+      drawStrip(i => i === S.cursor ? 1 : 0, pinFeats(rp).map(ff => S.pins[ff.key] != null
+        ? {led: S.pins[ff.key], label: FEAT[ff.key].tag} : null).filter(Boolean)
+        .concat(a.filter(q => q.auto).map(q => ({led: q.led, label: FEAT[q.key].tag, auto: true}))));
+    }
+    if (k === 'test' && rp) {
+      // the glow is tracked in radar distances and drawn at the matching spot on the template wall
+      const g = tickGlow(dt, now, rp, ts);
+      if (g.alpha > .004 && g.center != null) {
+        const dB = rp.feats.find(f => f.key === 'bottom').d, dT = rp.feats.find(f => f.key === 'top').d;
+        const d0 = clamp(g.center - g.half, dB, dT), d1 = clamp(g.center + g.half, dB, dT), pts2 = [];
+        for (let d = d0; d <= d1; d += 25) pts2.push(wallPoint(tp, mapAlong(d, rp.feats, tp.feats)));
+        ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.shadowColor = WARM(g.alpha); ctx.shadowBlur = 22; ctx.strokeStyle = `rgba(255,214,160,${g.alpha})`; ctx.lineWidth = 4;
+        polyline(ctx, V, pts2); ctx.stroke(); ctx.restore();
+      }
+      const a = anchors(rp, true);
+      let lo = 0, hi = 0;
+      if (g.alpha > .004 && g.center != null) {
+        const e1 = ledAt(g.center - g.half, a), e2 = ledAt(g.center + g.half, a);
+        lo = Math.min(e1, e2) - .5; hi = Math.max(e1, e2) + .5;
+      }
+      drawStrip(i => Math.pow(clamp(Math.min(i + .5, hi) - Math.max(i - .5, lo), 0, 1), 2.2) * g.alpha,
+        pinFeats(rp).map(ff => S.pins[ff.key] != null ? {led: S.pins[ff.key], label: FEAT[ff.key].tag} : null).filter(Boolean));
+    }
+
+    // people on the stairs, smoothed in radar space, drawn on the template
+    const seen = new Set(), ease = 1 - Math.exp(-dt * (simOn() ? 18 : 5));
+    if (rp && !rec) ts.forEach((t, i) => {
+      seen.add(i);
+      const d = disp[i] || (disp[i] = {x: t.x, y: t.y});
+      d.x += (t.x - d.x) * ease; d.y += (t.y - d.y) * ease;
+      if (onStairs(d)) drawTarget(ctx, V, toTemplate(rp, tp, d).pt, i === used);
+    });
+    for (const key of Object.keys(disp)) if (!seen.has(+key)) delete disp[key];
+    drawScale(ctx, V, h, stripOn ? 70 : 0);
+
+    const seeing = used >= 0;
+    readout = rec ? `● REC &nbsp;${S.trail.length} SAMPLES &nbsp;·&nbsp; ${seeing ? 'SEEING YOU' : 'NO TARGET'}`
+      : !rp ? (seeing ? 'SEEING YOU' : 'NO TARGET')
+      : !seeing ? 'NO TARGET' : onStairs(ts[used]) ? 'ON THE STAIRS' : 'OFF THE STAIRS';
+  }
+  if ($('readout').innerHTML !== readout) $('readout').innerHTML = readout;
+  requestAnimationFrame(frame);
+}
+
+if (S.screen > SC.walk && !S.cl) S.screen = SC.walk;
+render();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

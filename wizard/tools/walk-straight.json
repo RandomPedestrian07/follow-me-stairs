@@ -1,0 +1,81 @@
+[
+ {
+  "eval": "localStorage.clear(); location.reload(); 1",
+  "wait": 2500
+ },
+ {
+  "eval": "document.querySelector('[data-shape=\"straight\"]').click(); 1",
+  "wait": 500
+ },
+ {
+  "eval": "document.getElementById('next').click(); 1",
+  "wait": 400
+ },
+ {
+  "eval": "document.querySelector('[data-inc=\"s0\"]').click(); document.querySelector('[data-inc=\"w\"]').click(); 1",
+  "wait": 400
+ },
+ {
+  "eval": "document.getElementById('next').click(); 1",
+  "wait": 400
+ },
+ {
+  "eval": "document.querySelector('[data-side]').click(); document.querySelector('[data-start=\"bottom\"]').click(); 1",
+  "wait": 400
+ },
+ {
+  "eval": "document.getElementById('next').click(); 1",
+  "wait": 400
+ },
+ {
+  "eval": "document.getElementById('walkTap').click(); 1",
+  "wait": 3000
+ },
+ {
+  "eval": "document.getElementById('walkTap').click(); 1",
+  "wait": 9000
+ },
+ {
+  "eval": "document.getElementById('walkTap').click(); 1",
+  "wait": 9000
+ },
+ {
+  "eval": "document.getElementById('walkTap').click(); 1",
+  "wait": 1500,
+  "shot": "straight-walk.png"
+ },
+ {
+  "eval": "document.getElementById('next').click(); 1",
+  "wait": 600
+ },
+ {
+  "eval": "const h = document.getElementById('wledHost'); h.value = 'wled-stairs.local'; h.dispatchEvent(new Event('change')); 1",
+  "wait": 5000
+ },
+ {
+  "eval": "const e = document.getElementById('ledCount'); e.value = 150; e.dispatchEvent(new Event('change')); 1",
+  "wait": 600
+ },
+ {
+  "eval": "document.getElementById('pin').click(); 1",
+  "wait": 300
+ },
+ {
+  "eval": "document.getElementById('pin').click(); 1",
+  "wait": 300
+ },
+ {
+  "eval": "document.getElementById('next').textContent + ' | disabled=' + document.getElementById('next').disabled",
+  "wait": 200,
+  "shot": "straight-match.png"
+ },
+ {
+  "eval": "document.getElementById('next').click(); 1",
+  "wait": 1500
+ },
+ {
+  "eval": "document.getElementById('toast').textContent + ' | screen=' + document.getElementById('title').textContent",
+  "wait": 3000,
+  "shot": "straight-test.png"
+ }
+]

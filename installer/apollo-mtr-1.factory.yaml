@@ -1,0 +1,56 @@
+# Apollo MTR-1 with the follow-me stair light: the firmware the browser
+# installer flashes (installer/index.html, published to GitHub Pages by
+# .github/workflows/installer.yml on every version tag).
+#
+# Same as example/apollo-mtr-1.yaml without Wi-Fi credentials. After flashing,
+# the installer page asks for Wi-Fi over USB (Improv serial). Without it, the
+# sensor opens the "Apollo MTR1 Hotspot" access point with a captive portal.
+# Improv over Bluetooth is left out: it raises flash use from 69% to 91%.
+
+substitutions:
+  name: apollo-mtr-1
+  version: "26.3.2.1"            # Apollo's MTR-1 release, shown as its firmware version
+  follow_me_version: "dev"        # set by the installer workflow from the tag
+  follow_me_dir: ../firmware
+
+esphome:
+  name: "${name}"
+  friendly_name: Apollo MTR-1
+  comment: Apollo MTR-1 with follow-me-stairs
+  name_add_mac_suffix: true
+  project:
+    name: "follow-me-stairs.apollo-mtr-1"
+    version: "${follow_me_version}"
+  min_version: 2026.8.2
+  on_boot:
+    - priority: 500
+      then:
+        - text_sensor.template.publish:
+            id: apollo_firmware_version
+            state: "${version}"
+    - priority: -10
+      then:
+        - if:
+            condition:
+              - lambda: "return id(runTest);"
+            then:
+              - lambda: "id(testScript).execute();"
+
+logger:
+
+ota:
+  - platform: esphome
+    id: ota_default
+
+wifi:
+  power_save_mode: none
+  ap:
+    ssid: "Apollo MTR1 Hotspot"
+
+improv_serial:
+
+captive_portal:
+
+packages:
+  core: github://ApolloAutomation/MTR-1/Integrations/ESPHome/Core.yaml@26.3.2.1
+  follow_me: !include ../firmware/follow-me.yaml
