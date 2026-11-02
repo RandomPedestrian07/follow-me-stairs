@@ -32,7 +32,23 @@ Distances are in steps. One step is the average tread depth that the setup wizar
 | Follow-Me Glow | The light that follows people. Off turns follow-me off. It sets the brightness, color, white level and effect of the window. | On, white only, 40% |
 | Follow-Me Night Light | Lights a patch at each end of the stairs. It works when Follow-Me Glow is on or off. | Off. When turned on: white only, 5% |
 
-Follow-Me Glow effects: Rainbow, New Year's, Valentine's, St. Patrick's, Easter, Fourth of July, Autumn, Halloween, Haunted, Hanukkah, Christmas, Candy Cane, Snowfall, Fireplace, Aurora, Ocean. An effect replaces the color with a moving pattern, inside the window. The pattern stays fixed to the stairs, and the person walks through it. When Follow-Me Glow turns off, the effect goes back to None.
+Follow-Me Glow effects: Seasonal, Rainbow, New Year's, Valentine's, St. Patrick's, Easter, Fourth of July, Autumn, Halloween, Haunted, Hanukkah, Christmas, Candy Cane, Snowfall, Fireplace, Aurora, Ocean. An effect replaces the color with a moving pattern, inside the window. The pattern stays fixed to the stairs, and the person walks through it. When Follow-Me Glow turns off, the effect goes back to None.
+
+Seasonal shows the holiday effect for today's date. On days with no holiday, it shows the plain glow.
+
+| Dates | Effect |
+|---|---|
+| 31 Dec to 2 Jan | New Year's |
+| 10 to 14 Feb | Valentine's |
+| 15 to 17 Mar | St. Patrick's |
+| Good Friday to Easter Monday | Easter |
+| 22 Sep to 30 Nov | Autumn |
+| 17 to 23 Oct | Haunted |
+| 24 to 31 Oct | Halloween |
+| The 8 days of Hanukkah, from 25 Kislev | Hanukkah |
+| 1 to 26 Dec | Christmas |
+
+Hanukkah takes priority over Christmas on the days they overlap. The sensor sets its clock from the internet (NTP), in the time zone given by the `follow_me_timezone` substitution in the device configuration. The default is UTC. Until the clock is set, Seasonal shows the plain glow. Fourth of July is not part of Seasonal. Autumn follows the northern hemisphere.
 
 Where the window and the night light overlap, each LED shows the brighter of the two.
 

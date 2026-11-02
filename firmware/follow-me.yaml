@@ -102,6 +102,11 @@
 #     themselves do nothing in ESPHome; the stream paints them. Turning the
 #     light off resets the effect to None (ESPHome behaviour). At boot, an
 #     effect name without a pattern is logged as an error.
+#   - Seasonal: an effect that shows the holiday theme for today's date
+#     (follow-me-effects.h, seasonal_effect) and the plain glow on other
+#     days. The date comes from an NTP clock set to the substitution
+#     follow_me_timezone; until the clock is set, Seasonal shows the plain
+#     glow.
 #   - Night light: while the "Follow-Me Night Light" light is on, a patch
 #     "Follow-Me Night Light Size" steps long is lit at each end of the
 #     stairs, with a raised-cosine fade over NL_EDGE_STEPS on its inner side.
@@ -141,6 +146,14 @@ substitutions:
   # target number, 1-3. The defaults are Apollo's.
   radar_x_name: "Target-%d X"
   radar_y_name: "Target-%d Y"
+  # Time zone for the Seasonal effect's dates (a tz database name such as
+  # America/New_York).
+  follow_me_timezone: UTC
+
+time:
+  - platform: sntp
+    id: follow_me_time
+    timezone: ${follow_me_timezone}
 
 globals:
   # Follow-Me Glow channel values, 0-1.
@@ -244,6 +257,10 @@ light:
     # Effects only name a pattern; the stream paints it (follow-me-effects.h,
     # whose EFFECT_NAMES must match these names).
     effects:
+      - lambda:
+          name: "Seasonal"
+          update_interval: 1h
+          lambda: "// Painted by the follow-me stream."
       - lambda:
           name: "Rainbow"
           update_interval: 1h
@@ -907,7 +924,11 @@ interval:
           // Follow-Me Glow effect: replaces the colour with a per-LED pattern
           // at the light's brightness (transitions included).
           const StringRef fx_name = id(follow_me_glow).get_effect_name();
-          const follow_me::fx::Effect effect = follow_me::fx::from_name(fx_name.c_str(), fx_name.size());
+          follow_me::fx::Effect effect = follow_me::fx::from_name(fx_name.c_str(), fx_name.size());
+          if (effect == follow_me::fx::SEASONAL) {
+            const ESPTime clock = id(follow_me_time).now();
+            effect = follow_me::fx::resolve(effect, clock.is_valid(), clock.year, clock.month, clock.day_of_month);
+          }
           const LightColorValues &glow_now = id(follow_me_glow).current_values;
           const float fx_peak = glow_now.get_state() * glow_now.get_brightness() * 255.0f;
           const float fx_t = (now % 86400000u) / 1000.0f;  // wraps daily so float seconds keep ms resolution

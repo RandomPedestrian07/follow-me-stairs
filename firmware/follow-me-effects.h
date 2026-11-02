@@ -26,6 +26,7 @@ namespace fx {
 
 enum Effect {
   NONE = 0,
+  SEASONAL,
   RAINBOW,
   NEW_YEARS,
   VALENTINES,
@@ -46,9 +47,9 @@ enum Effect {
 };
 
 static const char *const EFFECT_NAMES[EFFECT_COUNT] = {
-    "None",           "Rainbow",   "New Year's", "Valentine's", "St. Patrick's", "Easter",
-    "Fourth of July", "Autumn",    "Halloween",  "Haunted",     "Hanukkah",      "Christmas",
-    "Candy Cane",     "Snowfall",  "Fireplace",  "Aurora",      "Ocean",
+    "None",           "Seasonal",  "Rainbow",    "New Year's", "Valentine's", "St. Patrick's",
+    "Easter",         "Fourth of July", "Autumn", "Halloween", "Haunted",    "Hanukkah",
+    "Christmas",      "Candy Cane", "Snowfall",  "Fireplace",  "Aurora",     "Ocean",
 };
 
 // Length of the stairs in wall inches, for patterns that span them
@@ -81,6 +82,8 @@ inline float smoothstep(float x) {
   return x * x * (3.0f - 2.0f * x);
 }
 inline float fract(float x) { return x - floorf(x); }
+// x wrapped into [0, m), also for negative x.
+inline float wrapf(float x, float m) { return x - floorf(x / m) * m; }
 
 inline uint32_t hash(uint32_t x) {
   x ^= x >> 16;
@@ -180,6 +183,85 @@ inline float burst(float wall, float t, float period, uint32_t seed, float focus
   return ring * fade;
 }
 
+// ---- Seasonal: the holiday effect for a calendar date -----------------------
+
+// Days since 1 January of year 1 (Gregorian, day 1 = 1 Jan 1).
+inline int gregorian_day(int y, int m, int d) {
+  const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+  return 365 * (y - 1) + (y - 1) / 4 - (y - 1) / 100 + (y - 1) / 400 + (367 * m - 362) / 12 +
+         (m <= 2 ? 0 : (leap ? -1 : -2)) + d;
+}
+
+// Easter Sunday (Gregorian), as a day number.
+inline int easter_day(int y) {
+  const int a = y % 19, b = y / 100, c = y % 100, d = b / 4, e = b % 4, f = (b + 8) / 25, g = (b - f + 1) / 3;
+  const int h = (19 * a + b - d - g + 15) % 30, i = c / 4, k = c % 4;
+  const int l = (32 + 2 * e + 2 * i - h - k) % 7, m = (a + 11 * h + 22 * l) / 451;
+  const int month = (h + l - 7 * m + 114) / 31, day = (h + l - 7 * m + 114) % 31 + 1;
+  return gregorian_day(y, month, day);
+}
+
+// Hebrew calendar: day number of 1 Tishrei (Rosh Hashanah) of Hebrew year hy,
+// in the same day numbering as gregorian_day.
+inline int hebrew_elapsed_days(int hy) {
+  const int months = (235 * hy - 234) / 19;
+  const int parts = 12084 + 13753 * months;
+  int days = 29 * months + parts / 25920;
+  if ((3 * (days + 1)) % 7 < 3) days++;
+  return days;
+}
+inline int hebrew_new_year(int hy) {
+  const int ny0 = hebrew_elapsed_days(hy - 1), ny1 = hebrew_elapsed_days(hy), ny2 = hebrew_elapsed_days(hy + 1);
+  const int delay = ny2 - ny1 == 356 ? 2 : (ny1 - ny0 == 382 ? 1 : 0);
+  return -1373427 + ny1 + delay;
+}
+
+// First day (25 Kislev) of Hanukkah in Hebrew year hy.
+inline int hanukkah_day(int hy) {
+  const int year_days = hebrew_new_year(hy + 1) - hebrew_new_year(hy);
+  const int cheshvan = year_days % 10 == 5 ? 30 : 29;  // 30 days in a "complete" year
+  return hebrew_new_year(hy) + 30 + cheshvan + 24;
+}
+
+// The holiday effect for a date: Hanukkah (8 days), New Year's (31 Dec to
+// 2 Jan), Valentine's (10 to 14 Feb), St. Patrick's (15 to 17 Mar), Easter
+// (Good Friday to Easter Monday), Haunted (17 to 23 Oct), Halloween (24 to
+// 31 Oct), Christmas (1 to 26 Dec) and, for the rest of 22 Sep to 30 Nov,
+// Autumn. Any other date gives NONE (the plain glow).
+inline Effect seasonal_effect(int y, int m, int d) {
+  const int today = gregorian_day(y, m, d);
+  int hy = y + 3760;
+  if (hebrew_new_year(hy + 1) <= today) hy++;
+  const int hanukkah = today - hanukkah_day(hy);
+  if (hanukkah >= 0 && hanukkah <= 7) return HANUKKAH;
+  if ((m == 12 && d == 31) || (m == 1 && d <= 2)) return NEW_YEARS;
+  if (m == 2 && d >= 10 && d <= 14) return VALENTINES;
+  if (m == 3 && d >= 15 && d <= 17) return ST_PATRICKS;
+  const int easter = today - easter_day(y);
+  if (easter >= -2 && easter <= 1) return EASTER;
+  if (m == 10 && d >= 17 && d <= 23) return HAUNTED;
+  if (m == 10 && d >= 24) return HALLOWEEN;
+  if (m == 12 && d <= 26) return CHRISTMAS;
+  if ((m == 9 && d >= 22) || m == 10 || m == 11) return AUTUMN;
+  return NONE;
+}
+
+// An effect with Seasonal resolved to today's effect. The date is looked up
+// only when it changes. valid is false while the clock has not been set,
+// which gives the plain glow.
+inline Effect resolve(Effect e, bool valid, int y, int m, int d) {
+  if (e != SEASONAL) return e;
+  if (!valid) return NONE;
+  static int cached_key = 0;
+  static Effect cached = NONE;
+  const int key = (y * 13 + m) * 32 + d;
+  if (key != cached_key) {
+    cached = seasonal_effect(y, m, d);
+    cached_key = key;
+  }
+  return cached;
+}
+
 // Colour of one LED for an effect. led is the LED index, wall the LED's
 // position in wall inches, t seconds (wraps daily), focus the centre of the
 // window lighting this LED and span its length in inches.
@@ -187,6 +269,7 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
   Rgbw c = {0, 0, 0, 0};
   switch (e) {
     case NONE:
+    case SEASONAL:  // resolved to a real effect by resolve() before painting
     case EFFECT_COUNT:
       break;
 
@@ -203,6 +286,13 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
       uint32_t slot;
       const float tw = twinkle(led, t, 0.7f, 0.35f, 12, &slot);
       if (tw > 0.0f) c = mix(c, CONFETTI[hash(slot * 7u + led) % 3], tw);
+      // Champagne fireworks burst around the person.
+      static const Rgbw FIREWORK[3] = {{1.0f, 0.7f, 0.2f, 0.4f}, {0.4f, 0.45f, 0.7f, 1.0f}, {1.0f, 0.35f, 0.3f, 0.2f}};
+      uint32_t fslot;
+      float b = burst(wall, t, 2.1f, 14, focus, span, &fslot);
+      if (b > 0.0f) c = lighten(c, scale(FIREWORK[fslot % 3], b));
+      b = burst(wall, t + 0.9f, 2.9f, 15, focus, span, &fslot);
+      if (b > 0.0f) c = lighten(c, scale(FIREWORK[(fslot + 1) % 3], b));
       break;
     }
 
@@ -214,6 +304,27 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
       const float p = fract(t / 1.4f);
       const float lub = expf(-p * 14.0f), dub = p > 0.22f ? 0.7f * expf(-(p - 0.22f) * 14.0f) : 0.0f;
       c = scale(c, 0.5f + 0.5f * fminf(1.0f, lub + dub));
+      // Hearts float up the stairs: from below the bottom to above the top,
+      // one per 14 in of rise on any stairs.
+      static const Rgbw HEART = {1.0f, 0.55f, 0.7f, 0.55f};
+      static const float MARGIN = 20.0f;
+      static const int MAX_HEARTS = 64;
+      const float loop = extent + 2.0f * MARGIN;
+      const int hearts = std::min(MAX_HEARTS, (int) (loop / 14.0f) + 1);
+      static float heart_t = -1.0f, heart_pos[MAX_HEARTS], heart_v[MAX_HEARTS];
+      if (t != heart_t) {
+        heart_t = t;
+        for (int k = 0; k < hearts; k++) {
+          const float speed = 2.5f + 2.5f * rnd(22, k);
+          const float sway = 1.2f * sinf(t * (1.0f + rnd(23, k)) + 6.2831853f * rnd(24, k));
+          heart_pos[k] = wrapf(rnd(25, k) * loop - speed * t, loop) - MARGIN + sway;
+          heart_v[k] = 0.65f + 0.35f * sinf(t * (2.0f + 2.0f * rnd(26, k)) + 6.2831853f * rnd(27, k));
+        }
+      }
+      for (int k = 0; k < hearts; k++) {
+        const float d = fabsf(wall - heart_pos[k]);
+        if (d < 2.0f) c = lighten(c, scale(HEART, heart_v[k] * (1.0f - d / 2.0f)));
+      }
       break;
     }
 
@@ -231,6 +342,10 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
       static const Rgbw PASTELS[5] = {{1.0f, 0.4f, 0.6f, 0.15f}, {0.35f, 1.0f, 0.55f, 0.1f}, {0.7f, 0.45f, 1.0f, 0.1f},
                                       {1.0f, 0.8f, 0.3f, 0.15f}, {0.4f, 0.7f, 1.0f, 0.1f}};
       c = blocks(wall - t * 1.5f, 9.0f, 41, PASTELS, 5, 0.5f);
+      // Breathing shimmer, and the odd soft sparkle.
+      static const Rgbw SPARKLE = {0.35f, 0.35f, 0.4f, 1.0f};
+      c = scale(c, 0.78f + 0.22f * noise(42, wall / 5.0f + t * 0.8f));
+      c = mix(c, SPARKLE, twinkle(led, t, 1.4f, 0.1f, 43));
       break;
     }
 
@@ -250,11 +365,43 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
     }
 
     case AUTUMN: {
-      // Rust, amber, gold and russet leaves drifting down the stairs.
-      static const Rgbw LEAVES[4] = {{0.85f, 0.2f, 0, 0}, {1.0f, 0.5f, 0, 0}, {1.0f, 0.75f, 0.08f, 0.1f},
-                                     {0.6f, 0.08f, 0.02f, 0}};
-      c = blocks(wall - t * 3.0f, 5.0f, 61, LEAVES, 4, 0.35f);
-      c = scale(c, 0.8f + 0.2f * noise(62, wall / 3.0f - t * 1.5f));
+      // Rust, amber, gold, russet and brown leaves drifting down the stairs.
+      static const Rgbw LEAVES[5] = {{0.85f, 0.2f, 0, 0}, {1.0f, 0.5f, 0, 0}, {1.0f, 0.75f, 0.08f, 0.1f},
+                                     {0.6f, 0.08f, 0.02f, 0}, {0.32f, 0.15f, 0.06f, 0}};
+      // Dim drifting colour blocks form the canopy; individual leaves fall
+      // through it, each at its own speed, swaying and tumbling.
+      c = blocks(wall - t * 3.0f, 5.0f, 61, LEAVES, 5, 0.35f);
+      c = scale(c, 0.55f * (0.8f + 0.2f * noise(62, wall / 3.0f - t * 1.5f)));
+      // Leaves fall from above the top to below the bottom and reappear at
+      // the top; their count keeps one leaf per 12 in of fall on any stairs.
+      static const float MARGIN = 20.0f;
+      static const int MAX_LEAVES = 96;
+      static const float GUST_CYCLE = 14.0f;  // seconds between gusts
+      static const float GUST_PUSH = 14.0f;   // inches a gust moves every leaf
+      static const float GUST_SECS = 2.0f;    // how long a gust lasts
+      const float loop = extent + 2.0f * MARGIN;
+      const int leaves = std::min(MAX_LEAVES, (int) (loop / 12.0f) + 1);
+      // Leaf positions, computed once per frame.
+      static float leaf_t = -1.0f, leaf_pos[MAX_LEAVES], leaf_v[MAX_LEAVES];
+      static uint8_t leaf_col[MAX_LEAVES];
+      if (t != leaf_t) {
+        leaf_t = t;
+        const float cycle = floorf(t / GUST_CYCLE);
+        const float local = t - cycle * GUST_CYCLE;
+        const float gust_at = 2.0f + rnd(63, (uint32_t) cycle) * (GUST_CYCLE - GUST_SECS - 4.0f);
+        const float gust = GUST_PUSH * (cycle + smoothstep((local - gust_at) / GUST_SECS));
+        for (int k = 0; k < leaves; k++) {
+          const float speed = 3.0f + 4.0f * rnd(64, k);
+          const float sway = 1.6f * sinf(t * (1.3f + 1.2f * rnd(65, k)) + 6.2831853f * rnd(66, k));
+          leaf_pos[k] = fmodf(rnd(67, k) * loop + speed * t + gust, loop) - MARGIN + sway;
+          leaf_v[k] = 0.5f + 0.5f * sinf(t * (1.8f + 1.6f * rnd(68, k)) + 6.2831853f * rnd(69, k));  // tumble
+          leaf_col[k] = (uint8_t) (hash(k * 2654435761u + 70u) % 5u);
+        }
+      }
+      for (int k = 0; k < leaves; k++) {
+        const float d = fabsf(wall - leaf_pos[k]);
+        if (d < 2.4f) c = lighten(c, scale(LEAVES[leaf_col[k]], (0.45f + 0.55f * leaf_v[k]) * (1.0f - d / 2.4f)));
+      }
       break;
     }
 
@@ -268,6 +415,27 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
       c = mix(ORANGE, PURPLE, m);
       c = scale(c, 0.55f + 0.45f * noise2(72, t * 6.0f, wall / 4.0f));  // flickers in clumps of a few LEDs
       c = mix(c, SLIME, twinkle(led, t, 2.5f, 0.05f, 73));
+      // A bat flies through every so often: a fast dark streak that flaps.
+      static const float MARGIN = 20.0f;
+      static const float BAT_CYCLE = 11.0f;
+      const float loop = extent + 2.0f * MARGIN;
+      const float bat_speed = fmaxf(45.0f, loop / 8.0f);
+      const uint32_t bslot = (uint32_t) floorf(t / BAT_CYCLE);
+      const float bt = t - bslot * BAT_CYCLE - 1.0f;
+      if (bt >= 0.0f && bt * bat_speed < loop) {
+        const float travel = bt * bat_speed;
+        const float bat = (rnd(74, bslot) < 0.5f ? travel : loop - travel) - MARGIN;
+        const float flap = 0.7f + 0.3f * sinf(t * 28.0f);
+        c = scale(c, 1.0f - 0.85f * flap * clamp01(1.0f - fabsf(wall - bat) / 3.5f));
+      }
+      // Now and then lightning flashes twice, pale purple-white.
+      static const Rgbw FLASH = {0.55f, 0.5f, 1.0f, 0.8f};
+      static const float STORM_CYCLE = 17.0f;
+      const uint32_t lslot = (uint32_t) floorf(t / STORM_CYCLE);
+      if (rnd(75, lslot) < 0.4f) {
+        const float lt = t - lslot * STORM_CYCLE - (1.0f + rnd(76, lslot) * 14.0f);
+        if ((lt >= 0.0f && lt < 0.06f) || (lt >= 0.14f && lt < 0.22f)) c = mix(c, FLASH, 0.8f);
+      }
       break;
     }
 
@@ -314,6 +482,10 @@ inline Rgbw paint(Effect e, int led, float wall, float t, float focus, float spa
       static const Rgbw RED = {1.0f, 0, 0.04f, 0};
       static const Rgbw WHITE = {0.2f, 0.2f, 0.2f, 1.0f};
       c = mix(WHITE, RED, stripe(wall - t * 3.0f, 8.0f, 0.5f, 1.5f));
+      // A soft gloss highlight slides along the stripes, faster than they scroll.
+      static const Rgbw GLOSS = {0.55f, 0.5f, 0.5f, 1.0f};
+      const float h = clamp01(1.0f - fabsf(wrapf(wall - t * 9.0f, 36.0f) - 18.0f) / 4.0f);
+      c = mix(c, GLOSS, 0.6f * h * h);
       break;
     }
 
